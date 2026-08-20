@@ -27,23 +27,6 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 The Worker does not generate or serve the userscript. The files are independent
 so Cloudflare's bundler cannot inject helper functions into the userscript.
 
-## Architecture
-
-```text
-Web page
-   │ click / Alt+click / selected text
-   ▼
-Userscript ── POST /tts ──► Cloudflare Worker
-   ▲                              │
-   │ streamed MP3                 │ outbound WebSocket
-   └──────────────────────────────┤
-                                  ▼
-                         Microsoft Edge TTS
-```
-
-The text being read is sent to both the deployed Worker and Microsoft's online
-speech service.
-
 ## Requirements
 
 - A Cloudflare account with Workers enabled.
@@ -64,8 +47,7 @@ Deploy the Worker:
 
 ```bash
 npx wrangler deploy ./bin/read-clipboard-edge-tts.js \
-  --name edge-point-reader \
-  --compatibility-date 2026-08-21
+  --name edge-point-reader
 ```
 
 Wrangler prints the deployed HTTPS address after a successful deployment.
@@ -93,18 +75,6 @@ Expected response:
   "service": "edge-point-reader"
 }
 ```
-
-### Dashboard deployment
-
-The Worker can also be deployed without Wrangler:
-
-1. Open Cloudflare Dashboard and go to **Workers & Pages**.
-2. Create a Worker.
-3. Replace the generated code with `read-clipboard-edge-tts.js`.
-4. Deploy it.
-5. Add an encrypted secret named `API_TOKEN` under the Worker's variables and
-   secrets settings.
-6. Copy the deployed HTTPS address.
 
 ## Install and configure the userscript
 
@@ -199,15 +169,6 @@ Limits and validation:
 - Text is limited to 4,000 UTF-8 bytes per request.
 - Voice names may contain letters, digits, and hyphens.
 - Rate must be between `-100%` and `+100%`.
-
-### `GET /health`
-
-Returns a small JSON health response. It does not test the upstream Microsoft
-speech connection.
-
-### `GET /`
-
-Returns a basic deployment and privacy information page.
 
 ## Troubleshooting
 
