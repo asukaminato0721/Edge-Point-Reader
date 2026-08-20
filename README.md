@@ -236,3 +236,7 @@ as inputs, text areas, selects, and buttons are intentionally ignored.
 - Edge TTS is an unofficial interface and can change without notice.
 - This implementation is intended for personal use. Review Microsoft's and
   Cloudflare's applicable terms and limits before broader deployment.
+
+---
+
+disclaim: This project is helped by gpt 5.6 sol high.
