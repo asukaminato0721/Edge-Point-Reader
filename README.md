@@ -1,22 +1,25 @@
 # Edge Point Reader for Linux
 
-Edge Point Reader adds Edge-style click-to-read speech to normal web pages on
-Linux. A userscript detects the sentence under the pointer, while a Cloudflare
-Worker streams Microsoft Edge neural TTS audio back to the browser.
+Edge Point Reader adds Edge-style selection-to-read speech to normal web pages
+on Linux. A userscript shows a small read badge beside selected text, while a
+Cloudflare Worker streams Microsoft Edge neural TTS audio back to the browser.
 
 The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 
 ## Features
 
-- Click a sentence to read it while point mode is enabled.
-- Use `Alt` + click without enabling point mode.
+- Show a small `朗` badge only when text is selected.
+- Drag the badge anywhere in the viewport, then click it to read the selection.
+- Hide the badge during playback and restore it when playback finishes.
 - Read selected text with `Alt` + `R`.
-- Highlight the sentence being read.
+- Support horizontal and vertical EPUB selections; ruby annotations are omitted
+  from speech.
+- Highlight the selection being read.
 - Stream MP3 audio with `fetch()` and `MediaSource` for faster startup.
 - Fall back to buffered Blob playback when MP3 `MediaSource` is unavailable.
 - Configure the Worker endpoint, API token, voice, and rate from the userscript
   menu.
-- Stop the request and playback immediately with the floating button or `Esc`.
+- Stop the request and playback immediately with `Esc` or the userscript menu.
 
 ## Files
 
@@ -101,26 +104,24 @@ specific Worker hostname:
 
 ## Usage
 
-### Point mode
+### Selection badge
 
-Click the floating `朗` button. It changes to `点`. Click any readable sentence
-to start speech. Click the button again to leave point mode.
+Select text to show a small `朗` badge beside the selection. Drag the badge to
+move it without changing the selection, or click it to start speech. The badge
+is hidden during playback and appears again when playback ends. Clearing the
+selection hides it.
 
 ### Shortcut mode
 
-- `Alt` + click: read the sentence under the pointer.
 - Select text, then press `Alt` + `R`: read the selection. The userscript uses
   the physical `KeyR` code so the shortcut also works with non-Latin keyboard
   layouts and input methods.
-- `Esc`: stop playback and leave point mode.
+- `Esc`: stop playback.
 
-Button states:
+Badge states:
 
-- `朗`: idle.
-- `点`: point mode enabled.
-- `…`: waiting for the first audio data.
-- `■`: playing; click to stop.
-- `!`: an error occurred; hover over the button for details.
+- `朗`: the current selection can be read.
+- `!`: an error occurred; hover over the badge for details.
 
 ### Settings
 
@@ -172,7 +173,7 @@ Limits and validation:
 
 ## Troubleshooting
 
-### The button asks for a Worker address
+### The badge asks for a Worker address
 
 Use the complete HTTPS `/tts` endpoint, not only the Worker origin.
 
@@ -205,10 +206,10 @@ Userscripts cannot normally run on `chrome://`, extension pages, or built-in PDF
 viewer pages. Use a normal HTML/PDF.js page or a dedicated browser extension for
 those cases.
 
-### A page click activates a link instead of speech
+### The selection badge does not appear
 
-Enable point mode first, or hold `Alt` while clicking. Interactive controls such
-as inputs, text areas, selects, and buttons are intentionally ignored.
+Make sure the selection contains non-whitespace text. The badge disappears while
+audio is playing and returns when playback ends or is stopped.
 
 ## Related projects
 

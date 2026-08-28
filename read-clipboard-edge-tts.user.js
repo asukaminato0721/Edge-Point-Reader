@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.3.1
-// @description  Stream Edge neural speech by Alt-clicking or enabling point mode
+// @version      1.5.0
+// @description  Stream Edge neural speech for selected text
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-idle
@@ -24,11 +24,9 @@
    * 4. If the Worker uses API_TOKEN, set the same value with "Set API_TOKEN".
    */
   const KEY = "edge-point-reader:";
-  const BLOCK_SELECTOR = "p,li,blockquote,pre,td,th,figcaption,dd,dt,h1,h2,h3,h4,h5,h6";
-  const IGNORE_SELECTOR = "input,textarea,select,option,button,[contenteditable=true]";
+  const NON_SPEECH_SELECTOR = "rt,rp,script,style,noscript,[aria-hidden=true]";
   const encoder = new TextEncoder();
 
-  let pointMode = false;
   let busy = false;
   let requestHandle = null;
   let abortController = null;
@@ -38,54 +36,100 @@
   let highlightedBlock = null;
   let requestSerial = 0;
   let errorTimer = null;
+  let selectionFrame = 0;
+  let dragState = null;
+  let draggedBadge = false;
+  let badgePosition = null;
 
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = "朗";
-  button.title = "开启点读；Alt+点击可随时朗读";
-  button.setAttribute("aria-label", "Edge 点读");
-  button.style.cssText = [
-    "all:initial", "position:fixed", "right:20px", "bottom:20px", "z-index:2147483647",
-    "width:46px", "height:46px", "border-radius:50%", "border:1px solid #ffffff55",
-    "background:#1769e0", "color:white", "font:600 18px/46px system-ui,sans-serif",
-    "text-align:center", "box-shadow:0 3px 14px #0005", "cursor:pointer", "user-select:none",
+  const selectionButton = document.createElement("button");
+  selectionButton.type = "button";
+  selectionButton.textContent = "朗";
+  selectionButton.title = "朗读选中文字";
+  selectionButton.setAttribute("aria-label", "朗读选中文字");
+  selectionButton.hidden = true;
+  selectionButton.style.cssText = [
+    "all:initial", "display:none", "position:fixed", "z-index:2147483647", "box-sizing:border-box",
+    "width:30px", "height:30px", "border-radius:9px", "border:1px solid #ffffff88",
+    "background:#1769e0", "color:white", "font:600 14px/28px system-ui,sans-serif",
+    "text-align:center", "box-shadow:0 2px 9px #0005", "cursor:grab", "user-select:none",
+    "touch-action:none",
   ].join(";");
-  document.documentElement.append(button);
+  document.documentElement.append(selectionButton);
 
   const style = document.createElement("style");
   style.textContent = `
     ::highlight(edge-point-reader-current) { background: rgba(255, 205, 40, .48); }
     .edge-point-reader-block { outline: 3px solid rgba(255, 190, 20, .65) !important; outline-offset: 2px !important; }
-    html.edge-point-reader-picking, html.edge-point-reader-picking * { cursor: crosshair !important; }
   `;
   document.documentElement.append(style);
 
-  button.addEventListener("click", (event) => {
+  selectionButton.addEventListener("pointerdown", (event) => {
+    // Keep the document selection intact until the click handler reads it.
     event.preventDefault();
     event.stopPropagation();
-    if (busy) {
-      stop();
-      return;
-    }
-    setPointMode(!pointMode);
+    draggedBadge = false;
+    const rect = selectionButton.getBoundingClientRect();
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      left: rect.left,
+      top: rect.top,
+    };
+    selectionButton.style.cursor = "grabbing";
+    try { selectionButton.setPointerCapture?.(event.pointerId); } catch {}
   });
 
-  document.addEventListener("click", (event) => {
-    if (event.target === button || (!pointMode && !event.altKey)) return;
-    if (event.target instanceof Element && event.target.closest(IGNORE_SELECTOR)) return;
+  selectionButton.addEventListener("pointermove", (event) => {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    const dx = event.clientX - dragState.startX;
+    const dy = event.clientY - dragState.startY;
+    if (Math.abs(dx) + Math.abs(dy) > 3) draggedBadge = true;
+    if (!draggedBadge) return;
+    badgePosition = clampBadgePosition(dragState.left + dx, dragState.top + dy);
+    applyBadgePosition(badgePosition);
+  });
 
-    const located = locateSentence(event.clientX, event.clientY, event.target);
-    if (!located?.text) return;
+  selectionButton.addEventListener("pointerup", finishBadgeDrag);
+  selectionButton.addEventListener("pointercancel", finishBadgeDrag);
 
+  function finishBadgeDrag(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    try { selectionButton.releasePointerCapture?.(event.pointerId); } catch {}
+    selectionButton.style.cursor = "grab";
+    dragState = null;
+  }
+
+  selectionButton.addEventListener("click", (event) => {
     event.preventDefault();
-    event.stopImmediatePropagation();
-    void speak(located.text, located.range, located.block);
-  }, true);
+    event.stopPropagation();
+    if (draggedBadge) {
+      draggedBadge = false;
+      return;
+    }
+    const selected = getSelectedContent();
+    if (!selected.text) {
+      hideSelectionButton();
+      return;
+    }
+    void speak(selected.text, selected.range, selected.block);
+  });
+
+  document.addEventListener("selectionchange", () => {
+    clearTimeout(errorTimer);
+    errorTimer = null;
+    resetSelectionButton();
+    badgePosition = null;
+    scheduleSelectionButton();
+  });
+  document.addEventListener("pointerup", scheduleSelectionButton);
+  document.addEventListener("keyup", scheduleSelectionButton);
+  window.addEventListener("resize", scheduleSelectionButton);
+  document.addEventListener("scroll", scheduleSelectionButton, true);
 
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       stop();
-      setPointMode(false);
     } else if (isReadSelectionShortcut(event)) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -118,12 +162,6 @@
     });
   }
 
-  function setPointMode(enabled) {
-    pointMode = enabled;
-    document.documentElement.classList.toggle("edge-point-reader-picking", enabled);
-    resetButton();
-  }
-
   function isReadSelectionShortcut(event) {
     if (!event.altKey || event.ctrlKey || event.metaKey) return false;
     return event.code === "KeyR" || event.key?.toLowerCase() === "r";
@@ -142,8 +180,10 @@
     }
 
     const selection = getSelection();
-    const text = selection?.toString().trim() || "";
-    const range = text && selection?.rangeCount ? selection.getRangeAt(0).cloneRange() : null;
+    const range = selection && !selection.isCollapsed && selection.rangeCount
+      ? selection.getRangeAt(0).cloneRange()
+      : null;
+    const text = range ? readableRangeText(range, selection.toString()).trim() : "";
     const common = range?.commonAncestorContainer;
     return {
       text,
@@ -152,103 +192,106 @@
     };
   }
 
-  function locateSentence(x, y, target) {
+  function scheduleSelectionButton() {
+    cancelAnimationFrame(selectionFrame);
+    selectionFrame = requestAnimationFrame(updateSelectionButton);
+  }
+
+  function updateSelectionButton() {
+    selectionFrame = 0;
+    if (busy) {
+      hideSelectionButton();
+      return;
+    }
+
+    const active = document.activeElement;
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+      const start = active.selectionStart ?? 0;
+      const end = active.selectionEnd ?? start;
+      if (start === end || !active.value.slice(start, end).trim()) {
+        hideSelectionButton();
+        return;
+      }
+      placeSelectionButton(active.getBoundingClientRect());
+      return;
+    }
+
     const selection = getSelection();
-    if (selection && !selection.isCollapsed && selection.toString().trim()) {
-      return {
-        text: trimUtf8(selection.toString().trim(), 4000),
-        range: selection.rangeCount ? selection.getRangeAt(0).cloneRange() : null,
-        block: selection.anchorNode?.parentElement,
-      };
+    if (!selection || selection.isCollapsed || !selection.toString().trim() || !selection.rangeCount) {
+      hideSelectionButton();
+      return;
     }
 
-    const caret = document.caretPositionFromPoint?.(x, y);
-    const rangeAtPoint = !caret && document.caretRangeFromPoint?.(x, y);
-    const node = caret?.offsetNode || rangeAtPoint?.startContainer;
-    const offset = caret?.offset ?? rangeAtPoint?.startOffset;
-    if (!node) return null;
-
-    const nodeElement = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
-    let block = nodeElement?.closest?.(BLOCK_SELECTOR);
-    if (!block) block = nearestReadableBlock(target instanceof Element ? target : target?.parentElement);
-    if (!block || !block.contains(node) || !block.textContent.trim()) return null;
-
-    const raw = block.textContent;
-    const point = characterOffset(block, node, offset);
-    if (point === null) return null;
-    const bounds = sentenceBounds(raw, point);
-    const text = trimUtf8(raw.slice(bounds.start, bounds.end).replace(/\s+/g, " ").trim(), 4000);
-    return { text, range: domRange(block, bounds.start, bounds.end), block };
+    const range = selection.getRangeAt(0);
+    placeSelectionButton(selectionEndpointRect(selection, range));
   }
 
-  function nearestReadableBlock(element) {
-    let candidate = element;
-    while (candidate && candidate !== document.body) {
-      const display = getComputedStyle(candidate).display;
-      const length = candidate.textContent?.trim().length || 0;
-      if ((display === "block" || display === "list-item") && length > 0 && length <= 5000) {
-        return candidate;
-      }
-      candidate = candidate.parentElement;
-    }
-    return null;
-  }
-
-  function characterOffset(root, targetNode, targetOffset) {
+  function selectionEndpointRect(selection, range) {
     try {
-      const prefix = document.createRange();
-      prefix.selectNodeContents(root);
-      prefix.setEnd(targetNode, targetOffset);
-      return prefix.toString().length;
+      const endpoint = document.createRange();
+      endpoint.setStart(selection.focusNode, selection.focusOffset);
+      endpoint.collapse(true);
+      const rect = endpoint.getClientRects()[0];
+      // A collapsed caret is thin in its inline direction. Some vertical-layout
+      // engines instead return the containing line box for element boundaries.
+      if (rect && (rect.width || rect.height) && (rect.width <= 2 || rect.height <= 2)) return rect;
+    } catch {}
+
+    const rects = range.getClientRects();
+    return rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+  }
+
+  function placeSelectionButton(rect) {
+    if (!rect || (!rect.width && !rect.height)) {
+      hideSelectionButton();
+      return;
+    }
+    if (!badgePosition) {
+      const gap = 6;
+      const size = 30;
+      const preferredLeft = rect.right + gap;
+      const preferredTop = rect.bottom + gap;
+      const alternateLeft = rect.left - size - gap;
+      const alternateTop = rect.top - size - gap;
+      const left = preferredLeft + size <= innerWidth - gap ? preferredLeft : alternateLeft;
+      const top = preferredTop + size <= innerHeight - gap ? preferredTop : alternateTop;
+      badgePosition = clampBadgePosition(left, top);
+    } else {
+      badgePosition = clampBadgePosition(badgePosition.left, badgePosition.top);
+    }
+    applyBadgePosition(badgePosition);
+    selectionButton.style.display = "block";
+    selectionButton.hidden = false;
+  }
+
+  function clampBadgePosition(left, top) {
+    const gap = 6;
+    const size = 30;
+    return {
+      left: Math.max(gap, Math.min(left, innerWidth - size - gap)),
+      top: Math.max(gap, Math.min(top, innerHeight - size - gap)),
+    };
+  }
+
+  function applyBadgePosition(position) {
+    selectionButton.style.left = `${position.left}px`;
+    selectionButton.style.top = `${position.top}px`;
+  }
+
+  function hideSelectionButton() {
+    selectionButton.hidden = true;
+    selectionButton.style.display = "none";
+  }
+
+  function readableRangeText(range, fallback = "") {
+    if (!range) return fallback;
+    try {
+      const fragment = range.cloneContents();
+      for (const element of fragment.querySelectorAll(NON_SPEECH_SELECTOR)) element.remove();
+      return fragment.textContent || "";
     } catch {
-      return null;
+      return fallback;
     }
-  }
-
-  function sentenceBounds(text, point) {
-    if (globalThis.Intl?.Segmenter) {
-      const locale = document.documentElement.lang || navigator.language;
-      const segmenter = new Intl.Segmenter(locale, { granularity: "sentence" });
-      for (const part of segmenter.segment(text)) {
-        const end = part.index + part.segment.length;
-        if (point >= part.index && point <= end) {
-          let start = part.index;
-          while (start < end && /\s/.test(text[start])) start++;
-          return { start, end };
-        }
-      }
-    }
-
-    const separators = /[。！？.!?；;\n]/;
-    let start = Math.max(0, Math.min(point, text.length));
-    let end = start;
-    while (start > 0 && !separators.test(text[start - 1])) start--;
-    while (end < text.length && !separators.test(text[end])) end++;
-    if (end < text.length) end++;
-    while (end < text.length && /[」』”’）)】\]\s]/.test(text[end])) end++;
-    while (start < end && /\s/.test(text[start])) start++;
-    return { start, end };
-  }
-
-  function domRange(root, start, end) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    const range = document.createRange();
-    let total = 0;
-    let started = false;
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      const next = total + node.data.length;
-      if (!started && start <= next) {
-        range.setStart(node, Math.max(0, start - total));
-        started = true;
-      }
-      if (started && end <= next) {
-        range.setEnd(node, Math.max(0, end - total));
-        return range;
-      }
-      total = next;
-    }
-    if (started) range.setEnd(root, root.childNodes.length);
-    return started ? range : null;
   }
 
   async function speak(text, range, block) {
@@ -259,7 +302,6 @@
 
     busy = true;
     highlight(range, block);
-    setButton("…", "正在生成语音；点击停止");
 
     const payload = JSON.stringify({
       text: trimUtf8(text, 4000),
@@ -359,11 +401,7 @@
     // This is called before the first await, while the click still counts as a
     // user gesture. MediaSource will feed audio to the pending player shortly.
     void player.play().then(
-      () => {
-        if (audio === player && serial === requestSerial) {
-          setButton("■", "正在流式朗读；点击停止");
-        }
-      },
+      undefined,
       (error) => {
         if (audio === player && serial === requestSerial && error?.name !== "AbortError") {
           fail(error?.message || "浏览器阻止了音频播放");
@@ -480,13 +518,15 @@
     busy = false;
     revokeAudioUrl();
     clearHighlight();
-    resetButton();
+    resetSelectionButton();
+    scheduleSelectionButton();
   }
 
   function stop() {
     requestSerial++;
     clearTimeout(errorTimer);
     errorTimer = null;
+    hideSelectionButton();
 
     const pending = requestHandle;
     requestHandle = null;
@@ -510,7 +550,8 @@
     busy = false;
     revokeAudioUrl();
     clearHighlight();
-    resetButton();
+    resetSelectionButton();
+    scheduleSelectionButton();
   }
 
   function fail(message) {
@@ -520,8 +561,17 @@
   }
 
   function showError(message) {
-    setButton("!", `Edge 点读：${message}`);
-    errorTimer = setTimeout(resetButton, 4000);
+    resetSelectionButton();
+    updateSelectionButton();
+    if (selectionButton.hidden) return;
+    selectionButton.textContent = "!";
+    selectionButton.title = `Edge 点读：${message}`;
+    selectionButton.setAttribute("aria-label", `Edge 点读错误：${message}`);
+    selectionButton.style.background = "#c62828";
+    errorTimer = setTimeout(() => {
+      resetSelectionButton();
+      scheduleSelectionButton();
+    }, 4000);
   }
 
   function revokeAudioUrl() {
@@ -558,16 +608,11 @@
     return /[\uD800-\uDBFF]$/.test(result) ? result.slice(0, -1) : result;
   }
 
-  function resetButton() {
-    setButton(
-      pointMode ? "点" : "朗",
-      pointMode ? "点读已开启；点击句子朗读" : "开启点读；Alt+点击可随时朗读",
-    );
-  }
-
-  function setButton(text, title) {
-    button.textContent = text;
-    button.title = title;
+  function resetSelectionButton() {
+    selectionButton.textContent = "朗";
+    selectionButton.title = "朗读选中文字";
+    selectionButton.setAttribute("aria-label", "朗读选中文字");
+    selectionButton.style.background = "#1769e0";
   }
 
   function getValue(key, fallback) {
