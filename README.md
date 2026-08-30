@@ -14,9 +14,13 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 - Read selected text with `Alt` + `R`.
 - Support horizontal and vertical EPUB selections; ruby annotations are omitted
   from speech.
-- Highlight the selection being read.
-- Stream MP3 audio with `fetch()` and `MediaSource` for faster startup.
-- Fall back to buffered Blob playback when MP3 `MediaSource` is unavailable.
+- Highlight the word currently being spoken without changing the EPUB DOM.
+- While speech is playing, click any word in the selection to continue from
+  that word.
+- Stream framed MP3 audio and word-boundary timing data with `fetch()` and
+  `MediaSource` for faster startup.
+- Fall back to buffered playback of the same framed stream when MP3
+  `MediaSource` is unavailable.
 - Configure the Worker endpoint, API token, voice, and rate from the userscript
   menu.
 - Stop the request and playback immediately with `Esc` or the userscript menu.
@@ -106,10 +110,16 @@ specific Worker hostname:
 
 ### Selection badge
 
-Select text to show a small `朗` badge beside the selection. Drag the badge to
-move it without changing the selection, or click it to start speech. The badge
-is hidden during playback and appears again when playback ends. Clearing the
-selection hides it.
+Select text to show a small, semi-transparent `朗` badge beside the selection.
+It becomes more opaque when hovered. Drag the badge to move it without changing
+the selection, or click it to start speech. The badge is hidden during playback
+and appears again when playback ends. The current word is highlighted as it is
+spoken. During playback, click another word in the selected passage to seek to
+it. Clearing the selection hides the badge.
+
+Word highlighting and click-to-seek apply to normal page text, including
+horizontal and vertical EPUB content. Text selected inside an `<input>` or
+`<textarea>` can still be read, but it has no DOM ranges for per-word tracking.
 
 ### Shortcut mode
 
@@ -159,11 +169,21 @@ curl https://YOUR_WORKER_HOST/tts \
     "voice": "ja-JP-NanamiNeural",
     "rate": "-20%"
   }' \
-  --output speech.mp3
+  --output speech.epr
 ```
 
-The response is a streamed `audio/mpeg` body. The `Authorization` header is only
-required when the Worker has an `API_TOKEN` secret.
+The response is a streamed
+`application/vnd.edge-point-reader.timed-stream` body. It is the only `/tts`
+response format; it is not a directly playable MP3. Each frame has a one-byte
+type, a four-byte big-endian payload length, and the payload:
+
+- Type `1`: MP3 bytes.
+- Type `2`: UTF-8 JSON with `offset`, `duration`, and `text` for a word boundary.
+  Offset and duration use 100-nanosecond ticks.
+
+The userscript decodes these frames while it feeds the MP3 payloads to the
+player. The `Authorization` header is only required when the Worker has an
+`API_TOKEN` secret.
 
 Limits and validation:
 

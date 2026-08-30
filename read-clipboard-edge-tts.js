@@ -37,6 +37,9 @@ const EDGE_EXTENSION_ORIGIN =
 const DEFAULT_VOICE = "ja-JP-NanamiNeural";
 const DEFAULT_RATE = "-20%";
 const MAX_TEXT_BYTES = 4000;
+const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
+const FRAME_AUDIO = 1;
+const FRAME_WORD_BOUNDARY = 2;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -187,7 +190,7 @@ async function synthesize(text, voice, rate) {
       const audio = packet.slice(audioStart);
       if (audio.byteLength) {
         receivedAudio = true;
-        controller.enqueue(audio);
+        controller.enqueue(streamFrame(FRAME_AUDIO, audio));
       }
     });
     pendingBinary.catch(finish);
@@ -203,9 +206,15 @@ async function synthesize(text, voice, rate) {
             if (!receivedAudio) finish(new Error("Microsoft returned no audio"));
             else finish();
           }, finish);
+        } else if (path === "audio.metadata") {
+          for (const boundary of wordBoundaries(event.data)) {
+            controller.enqueue(streamFrame(
+              FRAME_WORD_BOUNDARY,
+              new TextEncoder().encode(JSON.stringify(boundary)),
+            ));
+          }
         } else if (
           path &&
-          path !== "audio.metadata" &&
           path !== "response" &&
           path !== "turn.start"
         ) {
@@ -235,7 +244,7 @@ async function synthesize(text, voice, rate) {
       "Content-Type:application/json; charset=utf-8\r\n" +
       "Path:speech.config\r\n\r\n" +
       '{"context":{"synthesis":{"audio":{"metadataoptions":{' +
-      '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},' +
+      '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},' +
       '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n',
   );
 
@@ -256,7 +265,7 @@ async function synthesize(text, voice, rate) {
   return new Response(stream, {
     headers: {
       ...CORS_HEADERS,
-      "Content-Type": "audio/mpeg",
+      "Content-Type": TIMED_STREAM_TYPE,
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     },
@@ -314,6 +323,61 @@ function protocolPath(headers) {
   return headers.match(/(?:^|\r\n)Path:([^\r\n]+)/i)?.[1]?.trim().toLowerCase() || "";
 }
 
+function protocolBody(message) {
+  const separator = message.indexOf("\r\n\r\n");
+  return separator >= 0 ? message.slice(separator + 4) : "";
+}
+
+function wordBoundaries(message) {
+  const body = protocolBody(message);
+  if (!body) return [];
+  const metadata = JSON.parse(body);
+  const boundaries = [];
+  for (const item of metadata?.Metadata || []) {
+    if (item?.Type !== "WordBoundary") continue;
+    const offset = Number(item.Data?.Offset);
+    const duration = Number(item.Data?.Duration);
+    const text = item.Data?.text?.Text;
+    if (!Number.isFinite(offset) || !Number.isFinite(duration) || typeof text !== "string") {
+      continue;
+    }
+    boundaries.push({
+      offset,
+      duration,
+      text: unescapeXml(text),
+    });
+  }
+  return boundaries;
+}
+
+function streamFrame(type, payload) {
+  const frame = new Uint8Array(5 + payload.byteLength);
+  frame[0] = type;
+  new DataView(frame.buffer).setUint32(1, payload.byteLength);
+  frame.set(payload, 5);
+  return frame;
+}
+
+function unescapeXml(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, value) => safeCodePoint(value, 16))
+    .replace(/&#([0-9]+);/g, (_, value) => safeCodePoint(value, 10))
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+function safeCodePoint(value, radix) {
+  const codePoint = Number.parseInt(value, radix);
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return "\uFFFD";
+  }
+}
+
 function edgeTimestamp() {
   const date = new Date();
   const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -360,7 +424,7 @@ code{background:#eef1f5;padding:2px 5px;border-radius:4px} .warn{padding:12px 15
 </style></head><body><h1>Edge 点读</h1>
 <p>在 Linux 的 Chrome、Edge 或 Firefox 中，用 Microsoft Edge 在线语音朗读网页句子。</p>
 <p>Worker 已运行。请单独安装 <code>read-clipboard-edge-tts.user.js</code>，并在油猴菜单中设置此 Worker 的 <code>/tts</code> 地址。</p>
-<p>脚本中可按住 <code>Alt</code> 点击句子，或点右下角“朗”进入连续点读模式；选中文本后按 <code>Alt+R</code> 也可朗读。</p>
+<p>选中文字后会出现可拖动的“朗”浮标；点击即可朗读，也可按 <code>Alt+R</code>。朗读时会逐词高亮，点击选区内的词可从该词继续。</p>
 <p class="warn">${tokenStatus}</p>
 <p>隐私提示：朗读文字会发往此 Worker 和 Microsoft 的在线语音服务。Edge TTS 是非公开接口，微软升级协议后可能需要同步更新脚本。</p>
 </body></html>`;
