@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.6.0
+// @version      1.6.2
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -28,6 +28,7 @@
   const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
   const FRAME_AUDIO = 1;
   const FRAME_WORD_BOUNDARY = 2;
+  const MAX_TEXT_BYTES = 4000;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
@@ -49,6 +50,7 @@
   let wordSearchOffset = 0;
   let wordFrame = 0;
   let highlightedWord = -1;
+  let speechSession = null;
 
   const selectionButton = document.createElement("button");
   selectionButton.type = "button";
@@ -381,31 +383,62 @@
     const endpoint = getEndpoint();
     if (!endpoint) return;
 
+    const chunks = splitTextUtf8(text, MAX_TEXT_BYTES);
+    if (!chunks.length) return;
+
     busy = true;
     highlight(range, block);
-
-    const spokenText = trimUtf8(text, 4000);
-    prepareWordTracking(textMap, spokenText);
-
-    const payload = JSON.stringify({
-      text: spokenText,
+    speechSession = {
+      serial,
+      endpoint,
+      token: getValue("token", ""),
       voice: getValue("voice", "ja-JP-NanamiNeural"),
       rate: getValue("rate", "-20%"),
+      chunks,
+      index: 0,
+      textMap,
+      player: new Audio(),
+    };
+
+    void playSpeechChunk(speechSession);
+  }
+
+  async function playSpeechChunk(session) {
+    if (speechSession !== session || session.serial !== requestSerial) return;
+    const chunk = session.chunks[session.index];
+    if (!chunk) return;
+
+    prepareWordTracking(session.textMap, chunk);
+    const payload = JSON.stringify({
+      text: chunk.text,
+      voice: session.voice,
+      rate: session.rate,
     });
 
-    const token = getValue("token", "");
     try {
       if (canStreamMp3()) {
-        await streamAudio(endpoint, token, payload, serial);
+        await streamAudio(
+          session.endpoint,
+          session.token,
+          payload,
+          session.serial,
+          session.player,
+        );
       } else {
-        const blob = await requestAudio(endpoint, token, payload, serial);
-        if (serial !== requestSerial) return;
+        const blob = await requestAudio(
+          session.endpoint,
+          session.token,
+          payload,
+          session.serial,
+        );
+        if (speechSession !== session || session.serial !== requestSerial) return;
         if (!blob?.size) throw new Error("Worker 返回了空音频");
         objectUrl = URL.createObjectURL(blob);
-        startPlayer(new Audio(objectUrl), serial);
+        session.player.src = objectUrl;
+        startPlayer(session.player, session.serial);
       }
     } catch (error) {
-      if (serial !== requestSerial) return;
+      if (speechSession !== session || session.serial !== requestSerial) return;
       if (error?.name === "AbortError") return;
       fail(error?.message || String(error));
     }
@@ -415,14 +448,14 @@
     return Boolean(globalThis.MediaSource?.isTypeSupported?.("audio/mpeg"));
   }
 
-  async function streamAudio(endpoint, token, payload, serial) {
+  async function streamAudio(endpoint, token, payload, serial, player) {
     const controller = new AbortController();
     abortController = controller;
 
     const source = new MediaSource();
     mediaSource = source;
     objectUrl = URL.createObjectURL(source);
-    const player = new Audio(objectUrl);
+    player.src = objectUrl;
     startPlayer(player, serial);
 
     const headers = { "Content-Type": "application/json" };
@@ -601,9 +634,9 @@
     return blob;
   }
 
-  function prepareWordTracking(map, text) {
-    speechMap = map && map.text.startsWith(text)
-      ? { text, segments: map.segments }
+  function prepareWordTracking(map, chunk) {
+    speechMap = map && map.text.slice(chunk.start, chunk.end) === chunk.text
+      ? { text: chunk.text, textOffset: chunk.start, segments: map.segments }
       : null;
     wordTimeline = [];
     wordSearchOffset = 0;
@@ -654,14 +687,15 @@
 
   function pointForTextOffset(offset, endBias) {
     if (!speechMap) return null;
+    const documentOffset = speechMap.textOffset + offset;
     for (const segment of speechMap.segments) {
       const inside = endBias
-        ? offset > segment.textStart && offset <= segment.textEnd
-        : offset >= segment.textStart && offset < segment.textEnd;
+        ? documentOffset > segment.textStart && documentOffset <= segment.textEnd
+        : documentOffset >= segment.textStart && documentOffset < segment.textEnd;
       if (!inside) continue;
       return {
         node: segment.node,
-        offset: segment.nodeStart + offset - segment.textStart,
+        offset: segment.nodeStart + documentOffset - segment.textStart,
       };
     }
     return null;
@@ -713,10 +747,71 @@
     highlightedWord = index;
     globalThis.CSS?.highlights?.delete?.("edge-point-reader-word");
     const range = wordTimeline[index]?.range;
-    if (!range || !globalThis.Highlight || !globalThis.CSS?.highlights) return;
+    if (!range) return;
+    keepRangeVisible(range);
+    if (!globalThis.Highlight || !globalThis.CSS?.highlights) return;
     const highlight = new Highlight(range);
     highlight.priority = 1;
     CSS.highlights.set("edge-point-reader-word", highlight);
+  }
+
+  function keepRangeVisible(range) {
+    const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? range.startContainer
+      : range.startContainer.parentElement;
+
+    for (let container = startElement; container; container = container.parentElement) {
+      if (container === document.body || container === document.documentElement) continue;
+      const axes = scrollableAxes(container);
+      if (!axes.x && !axes.y) continue;
+      scrollRangeWithin(range, container, axes, 24);
+    }
+
+    const rect = range.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+    const margin = Math.min(48, innerWidth / 4, innerHeight / 4);
+    const left = overflowDelta(rect.left, rect.right, 0, innerWidth, margin);
+    const top = overflowDelta(rect.top, rect.bottom, 0, innerHeight, margin);
+    if (!left && !top) return;
+    const behavior = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+      ? "auto"
+      : "smooth";
+    window.scrollBy({ left, top, behavior });
+  }
+
+  function scrollableAxes(element) {
+    const style = getComputedStyle(element);
+    return {
+      x: /^(auto|scroll|overlay|hidden)$/.test(style.overflowX) &&
+        element.scrollWidth > element.clientWidth + 1,
+      y: /^(auto|scroll|overlay|hidden)$/.test(style.overflowY) &&
+        element.scrollHeight > element.clientHeight + 1,
+    };
+  }
+
+  function scrollRangeWithin(range, container, axes, margin) {
+    const wordRect = range.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const leftEdge = containerRect.left + container.clientLeft;
+    const topEdge = containerRect.top + container.clientTop;
+    const rightEdge = leftEdge + container.clientWidth;
+    const bottomEdge = topEdge + container.clientHeight;
+    const horizontalMargin = Math.min(margin, container.clientWidth / 4);
+    const verticalMargin = Math.min(margin, container.clientHeight / 4);
+    const left = axes.x
+      ? overflowDelta(wordRect.left, wordRect.right, leftEdge, rightEdge, horizontalMargin)
+      : 0;
+    const top = axes.y
+      ? overflowDelta(wordRect.top, wordRect.bottom, topEdge, bottomEdge, verticalMargin)
+      : 0;
+    if (left) container.scrollLeft += left;
+    if (top) container.scrollTop += top;
+  }
+
+  function overflowDelta(start, end, visibleStart, visibleEnd, margin) {
+    if (start < visibleStart + margin) return start - visibleStart - margin;
+    if (end > visibleEnd - margin) return end - visibleEnd + margin;
+    return 0;
   }
 
   function wordAtPoint(x, y) {
@@ -817,24 +912,38 @@
 
   function finishPlayback(player) {
     if (audio !== player) return;
+    detachPlayer(player);
+    audio = null;
+    mediaSource = null;
+    revokeAudioUrl();
+    clearWordTracking();
+
+    const session = speechSession;
+    if (session && session.serial === requestSerial && session.index + 1 < session.chunks.length) {
+      session.index++;
+      void playSpeechChunk(session);
+      return;
+    }
+
+    speechSession = null;
+    busy = false;
+    clearHighlight();
+    resetSelectionButton();
+    scheduleSelectionButton();
+  }
+
+  function detachPlayer(player) {
     player.onended = null;
     player.onerror = null;
     player.ontimeupdate = null;
     player.onplaying = null;
     player.onseeked = null;
     player.onpause = null;
-    audio = null;
-    mediaSource = null;
-    busy = false;
-    revokeAudioUrl();
-    clearHighlight();
-    clearWordTracking();
-    resetSelectionButton();
-    scheduleSelectionButton();
   }
 
   function stop() {
     requestSerial++;
+    speechSession = null;
     clearTimeout(errorTimer);
     errorTimer = null;
     hideSelectionButton();
@@ -850,12 +959,7 @@
     const player = audio;
     audio = null;
     if (player) {
-      player.onended = null;
-      player.onerror = null;
-      player.ontimeupdate = null;
-      player.onplaying = null;
-      player.onseeked = null;
-      player.onpause = null;
+      detachPlayer(player);
       try { player.pause(); } catch {}
       player.removeAttribute("src");
     }
@@ -913,17 +1017,53 @@
     highlightedBlock = null;
   }
 
-  function trimUtf8(text, maxBytes) {
-    if (encoder.encode(text).byteLength <= maxBytes) return text;
+  function splitTextUtf8(text, maxBytes) {
+    const chunks = [];
+    let start = 0;
+
+    while (start < text.length) {
+      let end = utf8End(text, start, maxBytes);
+      if (end < text.length) end = naturalSplit(text, start, end);
+      if (end <= start) end = utf8End(text, start, maxBytes);
+
+      const value = text.slice(start, end);
+      if (value.trim()) chunks.push({ text: value, start, end });
+      start = end;
+    }
+
+    return chunks;
+  }
+
+  function utf8End(text, start, maxBytes) {
+    if (encoder.encode(text.slice(start)).byteLength <= maxBytes) return text.length;
     let low = 0;
-    let high = text.length;
+    let high = text.length - start;
     while (low < high) {
       const middle = Math.ceil((low + high) / 2);
-      if (encoder.encode(text.slice(0, middle)).byteLength <= maxBytes) low = middle;
+      if (encoder.encode(text.slice(start, start + middle)).byteLength <= maxBytes) low = middle;
       else high = middle - 1;
     }
-    const result = text.slice(0, low);
-    return /[\uD800-\uDBFF]$/.test(result) ? result.slice(0, -1) : result;
+    let end = start + low;
+    if (/[\uD800-\uDBFF]/.test(text[end - 1] || "")) end--;
+    return end;
+  }
+
+  function naturalSplit(text, start, byteEnd) {
+    const candidate = text.slice(start, byteEnd);
+    const minimum = Math.floor(candidate.length / 2);
+    const sentenceEnd = lastBoundary(candidate, /[。！？!?；;\n][」』】）》”’]*[\t ]*/g, minimum);
+    if (sentenceEnd > 0) return start + sentenceEnd;
+    const phraseEnd = lastBoundary(candidate, /[，,、：:\s]+/g, minimum);
+    return phraseEnd > 0 ? start + phraseEnd : byteEnd;
+  }
+
+  function lastBoundary(text, pattern, minimum) {
+    let boundary = -1;
+    for (const match of text.matchAll(pattern)) {
+      const end = match.index + match[0].length;
+      if (end >= minimum) boundary = end;
+    }
+    return boundary;
   }
 
   function resetSelectionButton() {
