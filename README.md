@@ -115,7 +115,8 @@ It becomes more opaque when hovered. Drag the badge to move it without changing
 the selection, or click it to start speech. The badge is hidden during playback
 and appears again when playback ends. The current word is highlighted as it is
 spoken. During playback, click another word in the selected passage to seek to
-it. Clearing the selection hides the badge.
+it. Long selections are split at sentence or whitespace boundaries and all
+chunks are played automatically. Clearing the selection hides the badge.
 
 Word highlighting and click-to-seek apply to normal page text, including
 horizontal and vertical EPUB content. Text selected inside an `<input>` or
@@ -187,7 +188,8 @@ player. The `Authorization` header is only required when the Worker has an
 
 Limits and validation:
 
-- Text is limited to 4,000 UTF-8 bytes per request.
+- Text is limited to 4,000 UTF-8 bytes per request. The userscript automatically
+  splits longer selections into consecutive requests.
 - Voice names may contain letters, digits, and hyphens.
 - Rate must be between `-100%` and `+100%`.
 
