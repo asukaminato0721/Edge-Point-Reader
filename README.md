@@ -116,7 +116,9 @@ the selection, or click it to start speech. The badge is hidden during playback
 and appears again when playback ends. The current word is highlighted as it is
 spoken. During playback, click another word in the selected passage to seek to
 it. Long selections are split at sentence or whitespace boundaries and all
-chunks are played automatically. Clearing the selection hides the badge.
+chunks are played automatically. When the current word moves outside the visible
+area, the page or its scrollable reading container follows it automatically.
+Clearing the selection hides the badge.
 
 Word highlighting and click-to-seek apply to normal page text, including
 horizontal and vertical EPUB content. Text selected inside an `<input>` or

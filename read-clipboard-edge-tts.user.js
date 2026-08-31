@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.6.1
+// @version      1.6.2
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -747,10 +747,71 @@
     highlightedWord = index;
     globalThis.CSS?.highlights?.delete?.("edge-point-reader-word");
     const range = wordTimeline[index]?.range;
-    if (!range || !globalThis.Highlight || !globalThis.CSS?.highlights) return;
+    if (!range) return;
+    keepRangeVisible(range);
+    if (!globalThis.Highlight || !globalThis.CSS?.highlights) return;
     const highlight = new Highlight(range);
     highlight.priority = 1;
     CSS.highlights.set("edge-point-reader-word", highlight);
+  }
+
+  function keepRangeVisible(range) {
+    const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? range.startContainer
+      : range.startContainer.parentElement;
+
+    for (let container = startElement; container; container = container.parentElement) {
+      if (container === document.body || container === document.documentElement) continue;
+      const axes = scrollableAxes(container);
+      if (!axes.x && !axes.y) continue;
+      scrollRangeWithin(range, container, axes, 24);
+    }
+
+    const rect = range.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+    const margin = Math.min(48, innerWidth / 4, innerHeight / 4);
+    const left = overflowDelta(rect.left, rect.right, 0, innerWidth, margin);
+    const top = overflowDelta(rect.top, rect.bottom, 0, innerHeight, margin);
+    if (!left && !top) return;
+    const behavior = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+      ? "auto"
+      : "smooth";
+    window.scrollBy({ left, top, behavior });
+  }
+
+  function scrollableAxes(element) {
+    const style = getComputedStyle(element);
+    return {
+      x: /^(auto|scroll|overlay|hidden)$/.test(style.overflowX) &&
+        element.scrollWidth > element.clientWidth + 1,
+      y: /^(auto|scroll|overlay|hidden)$/.test(style.overflowY) &&
+        element.scrollHeight > element.clientHeight + 1,
+    };
+  }
+
+  function scrollRangeWithin(range, container, axes, margin) {
+    const wordRect = range.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const leftEdge = containerRect.left + container.clientLeft;
+    const topEdge = containerRect.top + container.clientTop;
+    const rightEdge = leftEdge + container.clientWidth;
+    const bottomEdge = topEdge + container.clientHeight;
+    const horizontalMargin = Math.min(margin, container.clientWidth / 4);
+    const verticalMargin = Math.min(margin, container.clientHeight / 4);
+    const left = axes.x
+      ? overflowDelta(wordRect.left, wordRect.right, leftEdge, rightEdge, horizontalMargin)
+      : 0;
+    const top = axes.y
+      ? overflowDelta(wordRect.top, wordRect.bottom, topEdge, bottomEdge, verticalMargin)
+      : 0;
+    if (left) container.scrollLeft += left;
+    if (top) container.scrollTop += top;
+  }
+
+  function overflowDelta(start, end, visibleStart, visibleEnd, margin) {
+    if (start < visibleStart + margin) return start - visibleStart - margin;
+    if (end > visibleEnd - margin) return end - visibleEnd + margin;
+    return 0;
   }
 
   function wordAtPoint(x, y) {
