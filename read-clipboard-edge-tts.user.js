@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.6.2
+// @version      1.6.3
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -397,16 +397,24 @@
       chunks,
       index: 0,
       textMap,
+      words: new Map(),
       player: new Audio(),
     };
 
     void playSpeechChunk(speechSession);
   }
 
-  async function playSpeechChunk(session) {
+  async function playSpeechChunk(session, textOffset) {
     if (speechSession !== session || session.serial !== requestSerial) return;
-    const chunk = session.chunks[session.index];
-    if (!chunk) return;
+    const serial = session.serial;
+    const originalChunk = session.chunks[session.index];
+    if (!originalChunk) return;
+    const start = textOffset ?? originalChunk.start;
+    const chunk = {
+      text: originalChunk.text.slice(start - originalChunk.start),
+      start,
+      end: originalChunk.end,
+    };
 
     prepareWordTracking(session.textMap, chunk);
     const payload = JSON.stringify({
@@ -421,7 +429,7 @@
           session.endpoint,
           session.token,
           payload,
-          session.serial,
+          serial,
           session.player,
         );
       } else {
@@ -429,16 +437,16 @@
           session.endpoint,
           session.token,
           payload,
-          session.serial,
+          serial,
         );
-        if (speechSession !== session || session.serial !== requestSerial) return;
+        if (speechSession !== session || serial !== requestSerial) return;
         if (!blob?.size) throw new Error("Worker 返回了空音频");
         objectUrl = URL.createObjectURL(blob);
         session.player.src = objectUrl;
-        startPlayer(session.player, session.serial);
+        startPlayer(session.player, serial);
       }
     } catch (error) {
-      if (speechSession !== session || session.serial !== requestSerial) return;
+      if (speechSession !== session || serial !== requestSerial) return;
       if (error?.name === "AbortError") return;
       fail(error?.message || String(error));
     }
@@ -660,13 +668,18 @@
       }
     }
 
-    wordTimeline.push({
+    const word = {
       start: offset / 10_000_000,
       duration: duration / 10_000_000,
       textStart,
       text,
       range,
-    });
+      textOffset: textStart >= 0 ? speechMap.textOffset + textStart : -1,
+      chunkIndex: speechSession?.index,
+    };
+    wordTimeline.push(word);
+    // Keep DOM positions for earlier chunks after their audio is released.
+    if (range) speechSession?.words.set(word.textOffset, word);
     scheduleWordFrame();
     return true;
   }
@@ -815,22 +828,37 @@
   }
 
   function wordAtPoint(x, y) {
-    for (const word of wordTimeline) {
-      if (!word.range) continue;
-      for (const rect of word.range.getClientRects()) {
-        if (x >= rect.left - 2 && x <= rect.right + 2 &&
-            y >= rect.top - 2 && y <= rect.bottom + 2) return word;
+    // Prefer the current request if synthesis changed word segmentation.
+    for (const words of [wordTimeline, speechSession?.words.values() ?? []]) {
+      for (const word of words) {
+        if (!word.range) continue;
+        for (const rect of word.range.getClientRects()) {
+          if (x >= rect.left - 2 && x <= rect.right + 2 &&
+              y >= rect.top - 2 && y <= rect.bottom + 2) return word;
+        }
       }
     }
     return null;
   }
 
   function seekToWord(word) {
+    const session = speechSession;
+    if (!session || session.serial !== requestSerial) return;
+    const index = wordTimeline.indexOf(word);
+    if (index < 0) {
+      // Timings belong to one audio request. Re-synthesize from the saved
+      // text position when the clicked word is outside the current request.
+      session.serial = ++requestSerial;
+      releasePlayback();
+      session.index = word.chunkIndex;
+      void playSpeechChunk(session, word.textOffset);
+      return;
+    }
     const player = audio;
     if (!player) return;
     try {
       player.currentTime = Math.max(0, word.start);
-      setHighlightedWord(wordTimeline.indexOf(word));
+      setHighlightedWord(index);
       if (player.paused) void player.play();
     } catch (error) {
       console.warn("[Edge 点读] 无法跳到所点文字", error);
@@ -863,6 +891,10 @@
         responseType: "arraybuffer",
         timeout: 35000,
         onload(response) {
+          if (serial !== requestSerial) {
+            reject(new DOMException("已停止", "AbortError"));
+            return;
+          }
           requestHandle = null;
           if (response.status >= 200 && response.status < 300) {
             try {
@@ -880,15 +912,15 @@
             : `TTS 请求失败：HTTP ${response.status}`));
         },
         onerror() {
-          requestHandle = null;
+          if (serial === requestSerial) requestHandle = null;
           reject(new Error("无法连接 TTS Worker"));
         },
         ontimeout() {
-          requestHandle = null;
+          if (serial === requestSerial) requestHandle = null;
           reject(new Error("TTS 请求超时"));
         },
         onabort() {
-          requestHandle = null;
+          if (serial === requestSerial) requestHandle = null;
           reject(new DOMException("已停止", "AbortError"));
         },
       });
@@ -948,6 +980,14 @@
     errorTimer = null;
     hideSelectionButton();
 
+    releasePlayback();
+    busy = false;
+    clearHighlight();
+    resetSelectionButton();
+    scheduleSelectionButton();
+  }
+
+  function releasePlayback() {
     const pending = requestHandle;
     requestHandle = null;
     try { pending?.abort?.(); } catch {}
@@ -966,12 +1006,8 @@
 
     mediaSource = null;
 
-    busy = false;
     revokeAudioUrl();
-    clearHighlight();
     clearWordTracking();
-    resetSelectionButton();
-    scheduleSelectionButton();
   }
 
   function fail(message) {

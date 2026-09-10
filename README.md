@@ -118,6 +118,9 @@ spoken. During playback, click another word in the selected passage to seek to
 it. Long selections are split at sentence or whitespace boundaries and all
 chunks are played automatically. When the current word moves outside the visible
 area, the page or its scrollable reading container follows it automatically.
+After automatic continuation, words from earlier chunks remain clickable.
+Clicking one requests new audio starting at that word, then continues through
+the remaining chunks. Seeking within the current audio uses its existing timeline.
 Clearing the selection hides the badge.
 
 Word highlighting and click-to-seek apply to normal page text, including
