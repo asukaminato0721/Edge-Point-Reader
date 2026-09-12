@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.6.3
+// @version      1.7.0
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -28,6 +28,7 @@
   const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
   const FRAME_AUDIO = 1;
   const FRAME_WORD_BOUNDARY = 2;
+  const FRAME_SEMANTIC_BOUNDARY = 3;
   const MAX_TEXT_BYTES = 4000;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -51,6 +52,9 @@
   let wordFrame = 0;
   let highlightedWord = -1;
   let speechSession = null;
+  let semanticTimeline = [];
+  let semanticPauseTimer = null;
+  let semanticSeekOffset = -1;
 
   const selectionButton = document.createElement("button");
   selectionButton.type = "button";
@@ -186,6 +190,11 @@
   registerMenu("Set voice", "voice", "ja-JP-NanamiNeural");
   registerMenu("Set rate (for example -20%)", "rate", "-20%");
   if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("切换意义停顿（下次朗读生效）", () => {
+      const enabled = !getValue("semantic", true);
+      setValue("semantic", enabled);
+      alert(`意义停顿已${enabled ? "开启" : "关闭"}，下次朗读生效`);
+    });
     GM_registerMenuCommand("停止朗读", stop);
   }
 
@@ -394,6 +403,7 @@
       token: getValue("token", ""),
       voice: getValue("voice", "ja-JP-NanamiNeural"),
       rate: getValue("rate", "-20%"),
+      semantic: getValue("semantic", true),
       chunks,
       index: 0,
       textMap,
@@ -421,6 +431,7 @@
       text: chunk.text,
       voice: session.voice,
       rate: session.rate,
+      semantic: session.semantic,
     });
 
     try {
@@ -512,6 +523,8 @@
             if (addWordBoundary(JSON.parse(decoder.decode(frame.payload)), serial)) {
               receivedBoundaries++;
             }
+          } else if (frame.type === FRAME_SEMANTIC_BOUNDARY) {
+            addSemanticBoundary(JSON.parse(decoder.decode(frame.payload)), serial);
           }
         }
       }
@@ -535,7 +548,11 @@
     audio = player;
     player.onended = () => finishPlayback(player);
     player.ontimeupdate = scheduleWordFrame;
-    player.onplaying = scheduleWordFrame;
+    player.onplaying = () => {
+      clearSemanticPause();
+      scheduleWordFrame();
+    };
+    player.onseeking = () => resetSemanticSeek(player.currentTime);
     player.onseeked = scheduleWordFrame;
     player.onpause = cancelWordFrame;
     player.onerror = () => {
@@ -602,7 +619,8 @@
         let offset = 0;
         while (input.byteLength - offset >= 5) {
           const type = input[offset];
-          if (type !== FRAME_AUDIO && type !== FRAME_WORD_BOUNDARY) {
+          if (type !== FRAME_AUDIO && type !== FRAME_WORD_BOUNDARY &&
+              type !== FRAME_SEMANTIC_BOUNDARY) {
             throw new Error("Worker 返回了无效的数据帧类型");
           }
           const length = new DataView(input.buffer, input.byteOffset + offset + 1, 4)
@@ -631,8 +649,12 @@
     let receivedBoundaries = 0;
     for (const frame of parser.push(new Uint8Array(buffer))) {
       if (frame.type === FRAME_AUDIO) audioChunks.push(frame.payload);
-      else if (addWordBoundary(JSON.parse(decoder.decode(frame.payload)), serial)) {
-        receivedBoundaries++;
+      else if (frame.type === FRAME_WORD_BOUNDARY) {
+        if (addWordBoundary(JSON.parse(decoder.decode(frame.payload)), serial)) {
+          receivedBoundaries++;
+        }
+      } else if (frame.type === FRAME_SEMANTIC_BOUNDARY) {
+        addSemanticBoundary(JSON.parse(decoder.decode(frame.payload)), serial);
       }
     }
     parser.finish();
@@ -643,9 +665,10 @@
   }
 
   function prepareWordTracking(map, chunk) {
+    clearWordTracking();
     speechMap = map && map.text.slice(chunk.start, chunk.end) === chunk.text
       ? { text: chunk.text, textOffset: chunk.start, segments: map.segments }
-      : null;
+      : { text: chunk.text, textOffset: chunk.start, segments: [] };
     wordTimeline = [];
     wordSearchOffset = 0;
     highlightedWord = -1;
@@ -680,6 +703,7 @@
     wordTimeline.push(word);
     // Keep DOM positions for earlier chunks after their audio is released.
     if (range) speechSession?.words.set(word.textOffset, word);
+    resolveSemanticTimes();
     scheduleWordFrame();
     return true;
   }
@@ -728,10 +752,84 @@
     wordFrame = 0;
     const player = audio;
     if (!player) return;
+    if (maybePauseAtSemanticBoundary(player)) return;
     setHighlightedWord(wordIndexAtTime(player.currentTime));
     if (!player.paused && !player.ended) {
       wordFrame = requestAnimationFrame(updateWordHighlight);
     }
+  }
+
+  function addSemanticBoundary(boundary, serial) {
+    if (serial !== requestSerial || !speechMap) return;
+    const offset = boundary?.offset;
+    const pauseMs = boundary?.pauseMs;
+    if (!Number.isInteger(offset) || offset <= 0 || offset >= speechMap.text.length ||
+        !Number.isFinite(pauseMs) || pauseMs <= 0 || pauseMs > 2000) return;
+    const existing = semanticTimeline.find((item) => item.offset === offset);
+    if (existing) existing.pauseMs = Math.max(existing.pauseMs, pauseMs);
+    else {
+      semanticTimeline.push({ offset, pauseMs, time: null, used: offset <= semanticSeekOffset });
+      semanticTimeline.sort((a, b) => a.offset - b.offset);
+    }
+    resolveSemanticTimes();
+  }
+
+  function resolveSemanticTimes() {
+    for (const boundary of semanticTimeline) {
+      if (boundary.time !== null) continue;
+      const nextWord = wordTimeline.find((word) => word.textStart >= boundary.offset);
+      if (!nextWord) continue;
+      boundary.time = nextWord.start;
+      // A seek can precede arrival of this word's metadata.
+      boundary.used ||= boundary.offset <= semanticSeekOffset ||
+        Boolean(audio && boundary.time < audio.currentTime - 0.12);
+    }
+  }
+
+  function clearSemanticPause() {
+    clearTimeout(semanticPauseTimer);
+    semanticPauseTimer = null;
+  }
+
+  function resetSemanticSeek(time) {
+    clearSemanticPause();
+    semanticSeekOffset = -1;
+    for (const word of wordTimeline) {
+      if (word.start <= time + 0.015) semanticSeekOffset = Math.max(semanticSeekOffset, word.textStart);
+    }
+    for (const boundary of semanticTimeline) {
+      boundary.used = boundary.offset <= semanticSeekOffset ||
+        (boundary.time !== null && boundary.time <= time + 0.015);
+    }
+  }
+
+  function maybePauseAtSemanticBoundary(player) {
+    if (semanticPauseTimer !== null || player.paused || player.ended || player.seeking) return false;
+    const current = player.currentTime;
+    let pauseMs = 0;
+    for (const boundary of semanticTimeline) {
+      if (boundary.used || boundary.time === null || current < boundary.time - 0.015) continue;
+      boundary.used = true;
+      // Skip stale metadata or background-tab delays; never rewind audible speech.
+      if (current <= boundary.time + 0.12) pauseMs = Math.max(pauseMs, boundary.pauseMs);
+    }
+    if (!pauseMs) return false;
+    const session = speechSession;
+    const serial = requestSerial;
+    player.pause();
+    const timer = setTimeout(() => {
+      if (semanticPauseTimer !== timer) return;
+      semanticPauseTimer = null;
+      if (audio !== player || !session || speechSession !== session ||
+          requestSerial !== serial || !player.paused || player.ended) return;
+      void player.play().catch((error) => {
+        if (audio === player && requestSerial === serial && error?.name !== "AbortError") {
+          fail(error?.message || "浏览器阻止了音频播放");
+        }
+      });
+    }, pauseMs);
+    semanticPauseTimer = timer;
+    return true;
   }
 
   function wordIndexAtTime(time) {
@@ -857,6 +955,7 @@
     const player = audio;
     if (!player) return;
     try {
+      resetSemanticSeek(word.start);
       player.currentTime = Math.max(0, word.start);
       setHighlightedWord(index);
       if (player.paused) void player.play();
@@ -867,6 +966,9 @@
 
   function clearWordTracking() {
     cancelWordFrame();
+    clearSemanticPause();
+    semanticTimeline = [];
+    semanticSeekOffset = -1;
     globalThis.CSS?.highlights?.delete?.("edge-point-reader-word");
     speechMap = null;
     wordTimeline = [];
@@ -889,7 +991,7 @@
         headers,
         data: payload,
         responseType: "arraybuffer",
-        timeout: 35000,
+        timeout: 45000,
         onload(response) {
           if (serial !== requestSerial) {
             reject(new DOMException("已停止", "AbortError"));
@@ -970,6 +1072,7 @@
     player.ontimeupdate = null;
     player.onplaying = null;
     player.onseeked = null;
+    player.onseeking = null;
     player.onpause = null;
   }
 

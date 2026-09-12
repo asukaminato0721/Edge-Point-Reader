@@ -1,0 +1,19 @@
+{
+	"name": "edge-point-reader",
+	"main": "read-clipboard-edge-tts.js",
+	"compatibility_date": "2026-08-20",
+	"placement": {
+		"mode": "smart"
+	},
+	"observability": {
+		"logs": {
+			"enabled": true
+		},
+		"traces": {
+			"enabled": true
+		}
+	}
+	// Configure SEMANTIC_API_URL (full HTTPS /chat/completions or /responses URL) and
+	// SEMANTIC_MODEL as Worker variables, or add them to a vars object here.
+	// Store SEMANTIC_API_TOKEN with: npx wrangler secret put SEMANTIC_API_TOKEN
+}

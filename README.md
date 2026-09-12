@@ -15,6 +15,8 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 - Support horizontal and vertical EPUB selections; ruby annotations are omitted
   from speech.
 - Highlight the word currently being spoken without changing the EPUB DOM.
+- Add meaning-based pauses (200 ms / 380 ms) using a user-configured AI API,
+  while synthesizing each full request as one continuous Edge utterance.
 - While speech is playing, click any word in the selection to continue from
   that word.
 - Stream framed MP3 audio and word-boundary timing data with `fetch()` and
@@ -30,6 +32,7 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 - `read-clipboard-edge-tts.js`: Cloudflare Module Worker and Edge TTS proxy.
 - `read-clipboard-edge-tts.user.js`: standalone Tampermonkey/Violentmonkey
   userscript.
+- `wrangler.jsonc`: Worker deployment configuration.
 
 The Worker does not generate or serve the userscript. The files are independent
 so Cloudflare's bundler cannot inject helper functions into the userscript.
@@ -53,8 +56,7 @@ npx wrangler login
 Deploy the Worker:
 
 ```bash
-npx wrangler deploy ./bin/read-clipboard-edge-tts.js \
-  --name edge-point-reader
+npx wrangler deploy
 ```
 
 Wrangler prints the deployed HTTPS address after a successful deployment.
@@ -82,6 +84,42 @@ Expected response:
   "service": "edge-point-reader"
 }
 ```
+
+### Configure semantic chunking
+
+Use your own OpenAI-compatible provider. Set these Worker variables in the
+Cloudflare dashboard (Settings → Variables and Secrets), or in `wrangler.jsonc`
+under `vars`:
+
+```json
+{
+  "SEMANTIC_API_URL": "https://YOUR_AI_HOST/v1/chat/completions",
+  "SEMANTIC_MODEL": "YOUR_MODEL_ID"
+}
+```
+
+`SEMANTIC_API_URL` must be the full HTTPS endpoint. A path ending in `/responses`
+uses the Responses API; otherwise the Worker uses Chat Completions. Responses
+requests use `input` and read message `output_text` content, following the
+[Responses API format](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create).
+The model is selected by you; no Workers AI binding is required.
+
+Store the provider token as a secret:
+
+```bash
+npx wrangler secret put SEMANTIC_API_TOKEN
+```
+
+This is separate from `API_TOKEN`, which protects your `/tts` endpoint. Provider
+credentials stay in the Worker and are never sent to the userscript. When enabled,
+the selected text is also sent to your configured AI provider. The AI may only
+insert `｜` and `‖`; any other change, including whitespace changes, rejects the
+result. Missing configuration, API errors, or an 8-second timeout fall back to
+punctuation boundaries, so speech can continue. No boundary means no extra pause.
+
+Update both the Worker and userscript before enabling this feature: older
+userscripts cannot decode type `3` frames. The userscript enables semantic pauses
+by default; the menu toggle applies to the next reading session.
 
 ## Install and configure the userscript
 
@@ -147,6 +185,7 @@ The userscript menu provides:
 - **Set API_TOKEN**
 - **Set voice**
 - **Set rate (for example -20%)**
+- **切换意义停顿（下次朗读生效）**: toggle semantic pauses, enabled by default.
 - **停止朗读**
 
 Voice names use Microsoft short-name format, for example:
@@ -159,6 +198,13 @@ en-US-EmmaMultilingualNeural
 ```
 
 Rates must include a sign and percent suffix, such as `-20%`, `+0%`, or `+25%`.
+
+Semantic pauses add 200 ms at small boundaries and 380 ms at large boundaries,
+on top of Edge's own pauses. The text and DOM are unchanged. Word metadata maps
+each boundary to the next word's start; boundaries inside a word move to the next
+word. Seeking skips earlier boundaries and rearms later ones. Stopping or changing
+chunks cancels pending resume timers. These are browser playback pauses, so timing
+is approximate; background-tab throttling may cause pauses to be skipped.
 
 ## Worker API
 
@@ -173,7 +219,8 @@ curl https://YOUR_WORKER_HOST/tts \
   --data '{
     "text": "こんにちは。",
     "voice": "ja-JP-NanamiNeural",
-    "rate": "-20%"
+    "rate": "-20%",
+    "semantic": true
   }' \
   --output speech.epr
 ```
@@ -186,10 +233,16 @@ type, a four-byte big-endian payload length, and the payload:
 - Type `1`: MP3 bytes.
 - Type `2`: UTF-8 JSON with `offset`, `duration`, and `text` for a word boundary.
   Offset and duration use 100-nanosecond ticks.
+- Type `3`: UTF-8 JSON with `offset`, `pauseMs`, and `level` (`small` or `large`).
+  Offset counts UTF-16 code units in the original request text, before whitespace
+  cleanup, relative to the current request. These frames precede the audio and
+  word frames and are only sent when `semantic` is exactly `true`.
 
 The userscript decodes these frames while it feeds the MP3 payloads to the
 player. The `Authorization` header is only required when the Worker has an
 `API_TOKEN` secret.
+
+Omit `semantic` or set it to `false` to skip the AI request and extra pauses.
 
 Limits and validation:
 
@@ -221,6 +274,16 @@ Chromium version and token-generation constants in the Worker.
 On Chromium, verify in the console that `MediaSource.isTypeSupported("audio/mpeg")`
 returns `true`. The first request can still include Worker startup and upstream
 WebSocket connection latency. Long sentences take longer to synthesize.
+Semantic chunking adds one AI request before synthesis; disable it from the menu
+to compare startup time and phrasing.
+
+### Only punctuation pauses are audible
+
+Check `SEMANTIC_API_URL`, `SEMANTIC_MODEL`, and `SEMANTIC_API_TOKEN`. Worker logs
+report when chunking falls back, without logging reading text or provider tokens.
+Malformed output, changed text, unsupported provider parameters, and slow responses
+all trigger this fallback. Compare models using the same passage and API endpoint;
+support for both API formats does not imply identical segmentation quality.
 
 ### Playback is blocked
 
@@ -237,6 +300,20 @@ those cases.
 
 Make sure the selection contains non-whitespace text. The badge disappears while
 audio is playing and returns when playback ends or is stopped.
+
+## Local checks
+
+Run the tests without external services or provider credentials:
+
+```bash
+node tests/semantic.test.mjs
+node --check read-clipboard-edge-tts.js
+node --check read-clipboard-edge-tts.user.js
+```
+
+The tests mock the provider, Edge socket, and browser media APIs. They check
+protocol handling and playback state; use a deployed Worker and a browser to
+evaluate actual Japanese segmentation and pause timing.
 
 ## Related projects
 
