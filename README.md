@@ -87,22 +87,22 @@ Expected response:
 
 ### Configure semantic chunking
 
-Use your own OpenAI-compatible provider. Set these Worker variables in the
-Cloudflare dashboard (Settings → Variables and Secrets), or in `wrangler.jsonc`
-under `vars`:
+Use your own OpenAI-compatible provider. Set **Set semantic API URL** and
+**Set semantic model** in the userscript menu. Alternatively, edit the defaults
+near the top of `read-clipboard-edge-tts.user.js` (saved menu values take priority):
 
-```json
-{
-  "SEMANTIC_API_URL": "https://YOUR_AI_HOST/v1/chat/completions",
-  "SEMANTIC_MODEL": "YOUR_MODEL_ID"
-}
+```javascript
+const SEMANTIC_API_URL = "https://YOUR_AI_HOST/v1/chat/completions";
+const SEMANTIC_MODEL = "YOUR_MODEL_ID";
 ```
 
 `SEMANTIC_API_URL` must be the full HTTPS endpoint. A path ending in `/responses`
 uses the Responses API; otherwise the Worker uses Chat Completions. Responses
 requests use `input` and read message `output_text` content, following the
 [Responses API format](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create).
-The model is selected by you; no Workers AI binding is required.
+The userscript sends these settings as `semanticApiUrl` and `semanticModel` on
+each `/tts` request. Changes apply to the next reading session. The Worker does
+not read these settings from environment variables; no Workers AI binding is required.
 
 Store the provider token as a secret:
 
@@ -110,12 +110,24 @@ Store the provider token as a secret:
 npx wrangler secret put SEMANTIC_API_TOKEN
 ```
 
-This is separate from `API_TOKEN`, which protects your `/tts` endpoint. Provider
+Also configure `API_TOKEN` and enter it using **Set API_TOKEN** in the userscript.
+This is required when using the AI secret: only authenticated callers may choose
+the endpoint that receives it. Without `API_TOKEN`, semantic requests return HTTP 400.
+The provider token is separate from `API_TOKEN`, which protects `/tts`. Provider
 credentials stay in the Worker and are never sent to the userscript. When enabled,
 the selected text is also sent to your configured AI provider. The AI may only
 insert `｜` and `‖`; any other change, including whitespace changes, rejects the
-result. Missing configuration, API errors, or an 8-second timeout fall back to
-punctuation boundaries, so speech can continue. No boundary means no extra pause.
+result. Missing configuration, API errors, or a 25-second timeout leave the
+original Edge speech playing without extra pauses. There is no punctuation
+fallback. **查看本次切分** reports the failure reason instead. A single enclosing
+Markdown code fence is accepted if the enclosed text passes the same exact check.
+
+Chat Completions requests for GPT-5 models use `max_completion_tokens`; other
+models retain `max_tokens`. `gpt-5.6-luna` uses low reasoning effort to reduce
+startup latency, in both Chat Completions and Responses requests. These parameters
+follow the [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+and [GPT-5.6 Luna model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
+Third-party gateways must support the corresponding request format.
 
 Update both the Worker and userscript before enabling this feature: older
 userscripts cannot decode type `3` frames. The userscript enables semantic pauses
@@ -183,9 +195,12 @@ The userscript menu provides:
 
 - **Set Worker endpoint**
 - **Set API_TOKEN**
+- **Set semantic API URL**
+- **Set semantic model**
 - **Set voice**
 - **Set rate (for example -20%)**
 - **切换意义停顿（下次朗读生效）**: toggle semantic pauses, enabled by default.
+- **查看本次切分**: inspect the boundaries received for the current or last reading.
 - **停止朗读**
 
 Voice names use Microsoft short-name format, for example:
@@ -206,6 +221,29 @@ word. Seeking skips earlier boundaries and rearms later ones. Stopping or changi
 chunks cancels pending resume timers. These are browser playback pauses, so timing
 is approximate; background-tab throttling may cause pauses to be skipped.
 
+### Inspect the segmentation
+
+Start reading, then choose **查看本次切分** from the userscript menu. A dialog shows
+the actual request text with `｜` (small) and `‖` (large) inserted at the received
+boundaries, plus the offsets and pause durations. You can select and copy the text.
+Opening the dialog does not make another AI request or pause playback. Pressing
+`Esc` while the dialog is open closes it; use the stop menu to stop reading there.
+
+Each request is labeled **AI 切分**, **AI 切分失败（未添加意义停顿）**, or
+**意义停顿已关闭**, including requests that return no boundaries. Failures report
+missing configuration, HTTP status, timeout, or output validation errors.
+Long selections show one entry per requested
+chunk. Clicking a word outside the current audio adds a new entry for that request.
+Entries update as data arrives and remain available after playback ends or stops;
+interrupted requests are marked as such. Starting another reading replaces the
+entries, and reloading the page clears them. Preview text is kept only in memory.
+
+Update both the Worker and userscript for source labels. With an older Worker,
+the dialog reports **来源未知（请更新 Worker）** rather than guessing the source.
+If an older Worker reports punctuation fallback, the userscript ignores those
+boundaries and asks you to update the Worker.
+The preview confirms segmentation positions, not whether every pause was audible.
+
 ## Worker API
 
 ### `POST /tts`
@@ -220,7 +258,9 @@ curl https://YOUR_WORKER_HOST/tts \
     "text": "こんにちは。",
     "voice": "ja-JP-NanamiNeural",
     "rate": "-20%",
-    "semantic": true
+    "semantic": true,
+    "semanticApiUrl": "https://YOUR_AI_HOST/v1/chat/completions",
+    "semanticModel": "YOUR_MODEL_ID"
   }' \
   --output speech.epr
 ```
@@ -240,7 +280,15 @@ type, a four-byte big-endian payload length, and the payload:
 
 The userscript decodes these frames while it feeds the MP3 payloads to the
 player. The `Authorization` header is only required when the Worker has an
-`API_TOKEN` secret.
+`API_TOKEN` secret. A Worker with `SEMANTIC_API_TOKEN` must also have `API_TOKEN`
+configured before accepting semantic requests with user-selected endpoints.
+
+Successful TTS responses include `X-Semantic-Source: ai`, `failed`, or `disabled`,
+exposed through CORS. This header identifies the source even when no type `3`
+frames are returned. Failed segmentation also includes `X-Semantic-Error`, a
+diagnostic code such as `missing_token`, `http_400`, `timeout`, or `changed_text`.
+Both streaming and buffered playback use these headers for the preview. Provider
+response bodies and tokens are not included in diagnostics.
 
 Omit `semantic` or set it to `false` to skip the AI request and extra pauses.
 
@@ -277,13 +325,21 @@ WebSocket connection latency. Long sentences take longer to synthesize.
 Semantic chunking adds one AI request before synthesis; disable it from the menu
 to compare startup time and phrasing.
 
-### Only punctuation pauses are audible
+### AI segmentation failed
 
-Check `SEMANTIC_API_URL`, `SEMANTIC_MODEL`, and `SEMANTIC_API_TOKEN`. Worker logs
-report when chunking falls back, without logging reading text or provider tokens.
-Malformed output, changed text, unsupported provider parameters, and slow responses
-all trigger this fallback. Compare models using the same passage and API endpoint;
+Check **Set semantic API URL** and **Set semantic model** in the userscript menu,
+and `SEMANTIC_API_TOKEN` in the Worker secrets. Open **查看本次切分** for the failure
+reason. Worker logs also include the diagnostic code without logging reading text
+or provider tokens. Malformed output, changed text, unsupported provider parameters,
+and slow responses disable extra pauses for that request. A result labeled
+**标点回退** comes from an older Worker; update both files. Compare models using the same passage and API endpoint;
 support for both API formats does not imply identical segmentation quality.
+
+If an older Worker reports a network error even though the AI endpoint works
+directly, update the Worker: the previous `redirect: "error"` setting throws in
+workerd before sending the request. The Worker now uses `redirect: "manual"`
+and reports HTTP redirects. Set the final API URL when a redirect is reported;
+the Worker does not forward the AI token to redirected destinations.
 
 ### Playback is blocked
 

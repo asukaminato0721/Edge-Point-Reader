@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.7.0
+// @version      1.7.5
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -24,6 +24,9 @@
    * 4. If the Worker uses API_TOKEN, set the same value with "Set API_TOKEN".
    */
   const KEY = "edge-point-reader:";
+  // Optional defaults; userscript menu settings override these values.
+  const SEMANTIC_API_URL = ""; // Full HTTPS /chat/completions or /responses URL.
+  const SEMANTIC_MODEL = "";
   const NON_SPEECH_SELECTOR = "rt,rp,script,style,noscript,[aria-hidden=true]";
   const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
   const FRAME_AUDIO = 1;
@@ -55,6 +58,11 @@
   let semanticTimeline = [];
   let semanticPauseTimer = null;
   let semanticSeekOffset = -1;
+  // Keep the last reading's received data in memory after playback stops.
+  let semanticPreviewRecords = [];
+  let currentSemanticPreview = null;
+  let semanticPreviewDialog = null;
+  let semanticPreviewText = null;
 
   const selectionButton = document.createElement("button");
   selectionButton.type = "button";
@@ -140,6 +148,7 @@
   });
 
   document.addEventListener("pointerdown", (event) => {
+    if (semanticPreviewDialog?.contains(event.target)) return;
     if (!busy || event.button !== 0) return;
     const word = wordAtPoint(event.clientX, event.clientY);
     if (!word) return;
@@ -149,6 +158,7 @@
   }, true);
 
   document.addEventListener("click", (event) => {
+    if (semanticPreviewDialog?.contains(event.target)) return;
     if (!busy || event.button !== 0) return;
     const word = wordAtPoint(event.clientX, event.clientY);
     if (!word) return;
@@ -169,6 +179,7 @@
   document.addEventListener("scroll", scheduleSelectionButton, true);
 
   window.addEventListener("keydown", (event) => {
+    if (semanticPreviewDialog?.open) return;
     if (event.key === "Escape") {
       stop();
     } else if (isReadSelectionShortcut(event)) {
@@ -187,9 +198,12 @@
 
   registerMenu("Set Worker endpoint", "endpoint", "");
   registerMenu("Set API_TOKEN", "token", "", true);
+  registerMenu("Set semantic API URL", "semanticApiUrl", SEMANTIC_API_URL);
+  registerMenu("Set semantic model", "semanticModel", SEMANTIC_MODEL);
   registerMenu("Set voice", "voice", "ja-JP-NanamiNeural");
   registerMenu("Set rate (for example -20%)", "rate", "-20%");
   if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("查看本次切分", showSemanticPreview);
     GM_registerMenuCommand("切换意义停顿（下次朗读生效）", () => {
       const enabled = !getValue("semantic", true);
       setValue("semantic", enabled);
@@ -394,6 +408,9 @@
 
     const chunks = splitTextUtf8(text, MAX_TEXT_BYTES);
     if (!chunks.length) return;
+    semanticPreviewRecords = [];
+    currentSemanticPreview = null;
+    refreshSemanticPreview();
 
     busy = true;
     highlight(range, block);
@@ -404,6 +421,8 @@
       voice: getValue("voice", "ja-JP-NanamiNeural"),
       rate: getValue("rate", "-20%"),
       semantic: getValue("semantic", true),
+      semanticApiUrl: getValue("semanticApiUrl", SEMANTIC_API_URL),
+      semanticModel: getValue("semanticModel", SEMANTIC_MODEL),
       chunks,
       index: 0,
       textMap,
@@ -427,11 +446,23 @@
     };
 
     prepareWordTracking(session.textMap, chunk);
+    currentSemanticPreview = {
+      text: chunk.text,
+      start: chunk.start,
+      chunkIndex: session.index,
+      source: session.semantic ? "pending" : "disabled",
+      state: "receiving",
+      boundaries: [],
+    };
+    semanticPreviewRecords.push(currentSemanticPreview);
+    refreshSemanticPreview();
     const payload = JSON.stringify({
       text: chunk.text,
       voice: session.voice,
       rate: session.rate,
       semantic: session.semantic,
+      semanticApiUrl: session.semanticApiUrl,
+      semanticModel: session.semanticModel,
     });
 
     try {
@@ -459,6 +490,7 @@
     } catch (error) {
       if (speechSession !== session || serial !== requestSerial) return;
       if (error?.name === "AbortError") return;
+      finishSemanticPreview(currentSemanticPreview, "failed", serial);
       fail(error?.message || String(error));
     }
   }
@@ -468,6 +500,7 @@
   }
 
   async function streamAudio(endpoint, token, payload, serial, player) {
+    const preview = currentSemanticPreview;
     const controller = new AbortController();
     abortController = controller;
 
@@ -499,6 +532,8 @@
       throw new Error("Worker 没有返回逐词时间轴数据");
     }
     if (!response.body) throw new Error("浏览器没有提供流式响应");
+    setSemanticPreviewSource(preview, response.headers.get("X-Semantic-Source"), serial,
+      response.headers.get("X-Semantic-Error"));
 
     const sourceBuffer = source.addSourceBuffer("audio/mpeg");
     const reader = response.body.getReader();
@@ -532,6 +567,7 @@
       frameParser.finish();
       if (!receivedBytes) throw new Error("Worker 返回了空音频");
       if (!receivedBoundaries) throw new Error("Worker 没有返回词边界时间轴");
+      finishSemanticPreview(preview, "complete", serial);
       if (source.readyState === "open") {
         if (sourceBuffer.updating) {
           await waitForEvent(sourceBuffer, "updateend", controller.signal);
@@ -761,6 +797,8 @@
 
   function addSemanticBoundary(boundary, serial) {
     if (serial !== requestSerial || !speechMap) return;
+    // Older Workers can still send punctuation fallback frames. Do not play them.
+    if (["fallback", "failed", "disabled"].includes(currentSemanticPreview?.source)) return;
     const offset = boundary?.offset;
     const pauseMs = boundary?.pauseMs;
     if (!Number.isInteger(offset) || offset <= 0 || offset >= speechMap.text.length ||
@@ -768,10 +806,140 @@
     const existing = semanticTimeline.find((item) => item.offset === offset);
     if (existing) existing.pauseMs = Math.max(existing.pauseMs, pauseMs);
     else {
-      semanticTimeline.push({ offset, pauseMs, time: null, used: offset <= semanticSeekOffset });
+      semanticTimeline.push({
+        offset, pauseMs, level: boundary.level === "large" ? "large" : "small",
+        time: null, used: offset <= semanticSeekOffset,
+      });
       semanticTimeline.sort((a, b) => a.offset - b.offset);
     }
+    if (existing && boundary.level === "large") existing.level = "large";
+    if (currentSemanticPreview) {
+      currentSemanticPreview.boundaries = semanticTimeline.map(({ offset, pauseMs, level }) => ({ offset, pauseMs, level }));
+      refreshSemanticPreview();
+    }
     resolveSemanticTimes();
+  }
+
+  function setSemanticPreviewSource(preview, source, serial, errorCode) {
+    if (!preview || preview !== currentSemanticPreview || serial !== requestSerial) return;
+    preview.source = ["ai", "fallback", "failed", "disabled"].includes(source) ? source : "unknown";
+    preview.error = semanticErrorDescription(errorCode);
+    refreshSemanticPreview();
+  }
+
+  function semanticErrorDescription(code) {
+    const errors = {
+      missing_api_url: "未设置 AI API 地址，请检查 Set semantic API URL。",
+      missing_model: "未设置模型，请检查 Set semantic model。",
+      missing_token: "Worker 未配置 SEMANTIC_API_TOKEN secret。",
+      invalid_api_url: "AI API 地址无效，需要完整的 HTTPS 接口地址。",
+      timeout: "AI 请求超过 25 秒，已停止等待。",
+      invalid_response: "AI 接口未返回预期的文本格式，请检查接口路径和兼容性。",
+      empty_output: "AI 返回了空文本。",
+      truncated_output: "AI 输出达到长度限制，未返回完整原文。",
+      changed_text: "AI 改动了原文（包括标点、空白或换行），切分结果已拒绝。",
+      split_character: "AI 把边界插入了一个 Unicode 字符内部，切分结果已拒绝。",
+      network_error: "Worker 无法完成 AI 请求，请检查接口连通性。",
+      internal_error: "Worker 处理 AI 结果时出错。",
+    };
+    if (Object.hasOwn(errors, code)) return errors[code];
+    const status = typeof code === "string" ? code.match(/^http_(\d{3})$/)?.[1] : null;
+    if (status) {
+      if (Number(status) >= 300 && Number(status) < 400) {
+        return `AI 接口返回 HTTP ${status} 重定向，请将 Set semantic API URL 改为最终接口地址。`;
+      }
+      const hints = {
+        400: "请求参数被拒绝，请检查模型与接口兼容性。",
+        401: "AI Token 无效或已过期。", 403: "AI Token 没有访问权限。",
+        404: "接口路径或模型不存在。", 429: "AI 服务限流或额度不足。",
+      };
+      return `AI 接口返回 HTTP ${status}。${hints[status] || "请检查 AI 服务状态。"}`;
+    }
+    return "";
+  }
+
+  function finishSemanticPreview(preview, state, serial) {
+    if (!preview || preview !== currentSemanticPreview || serial !== requestSerial) return;
+    preview.state = state;
+    refreshSemanticPreview();
+  }
+
+  function semanticPreviewContent() {
+    if (!semanticPreviewRecords.length) return "还没有朗读记录。请先选择文字并开始朗读。";
+    const sources = {
+      ai: "AI 切分", fallback: "旧版 Worker 标点回退（已忽略，请更新 Worker）",
+      failed: "AI 切分失败（未添加意义停顿）", disabled: "意义停顿已关闭",
+      pending: "等待 Worker 返回结果", unknown: "来源未知（请更新 Worker）",
+    };
+    const states = { receiving: "接收中", complete: "接收完成", stopped: "已中断", failed: "请求失败" };
+    const sections = semanticPreviewRecords.map((record, index) => {
+      let marked = "";
+      let previous = 0;
+      for (const boundary of record.boundaries) {
+        marked += record.text.slice(previous, boundary.offset) + (boundary.level === "large" ? "‖" : "｜");
+        previous = boundary.offset;
+      }
+      marked += record.text.slice(previous);
+      const positions = record.boundaries.length
+        ? "边界（本段 UTF-16 偏移 → 停顿）：" + record.boundaries
+          .map((boundary) => `${boundary.offset} → ${boundary.pauseMs}ms`).join("；")
+        : ["failed", "fallback"].includes(record.source) ? "本段未添加意义停顿。"
+          : record.state === "complete" ? "本段没有意义边界。" : "尚未收到意义边界。";
+      const error = record.source === "failed" ? `\n原因：${record.error || "Worker 未提供错误详情，请更新 Worker。"}` : "";
+      return `请求 ${index + 1} · 第 ${record.chunkIndex + 1} 段 · 选区偏移 ${record.start}\n` +
+        `${sources[record.source]} · ${states[record.state]}${error}\n\n${marked}\n\n${positions}`;
+    });
+    return "｜ 小边界（默认 200ms）  ‖ 大边界（默认 380ms）\n" +
+      "以下为本次播放实际收到的切分，不会再次请求 AI。原文自带的 ｜ 和 ‖ 会保留。\n" +
+      "这里只确认切分位置；实际暂停会对齐到后一个词，后台播放可能跳过迟到的边界。\n\n" + sections.join("\n\n────────────\n\n");
+  }
+
+  function refreshSemanticPreview() {
+    const output = semanticPreviewText;
+    if (!output) return;
+    const content = semanticPreviewContent();
+    if (output.value === content) return;
+    const { scrollTop, scrollLeft, selectionStart, selectionEnd, selectionDirection } = output;
+    output.value = content;
+    output.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+    output.scrollTop = scrollTop;
+    output.scrollLeft = scrollLeft;
+  }
+
+  function showSemanticPreview() {
+    if (semanticPreviewDialog) {
+      refreshSemanticPreview();
+      semanticPreviewDialog.focus({ preventScroll: true });
+      return;
+    }
+    const dialog = document.createElement("dialog");
+    dialog.setAttribute("aria-label", "本次意义切分");
+    dialog.style.cssText = "position:fixed;inset:0;margin:auto;width:min(800px,90vw);max-height:85vh;box-sizing:border-box;padding:20px;border:1px solid #aaa;border-radius:12px;background:#fff;color:#18202a;writing-mode:horizontal-tb;font:16px/1.5 system-ui,sans-serif;";
+    const title = document.createElement("h2");
+    title.textContent = "本次意义切分";
+    title.style.cssText = "margin:0 0 12px;font:600 20px/1.5 system-ui,sans-serif;color:#18202a;";
+    const output = document.createElement("textarea");
+    output.readOnly = true;
+    output.setAttribute("aria-label", "切分结果（可选择复制）");
+    output.style.cssText = "display:block;width:100%;height:50vh;box-sizing:border-box;padding:12px;border:1px solid #aaa;background:#f7f8fa;color:#18202a;writing-mode:horizontal-tb;direction:ltr;white-space:pre-wrap;font:16px/1.8 system-ui,sans-serif;resize:vertical;";
+    const close = document.createElement("button");
+    close.type = "button";
+    // Avoid auto-focusing the textarea at the end of its populated value.
+    close.autofocus = true;
+    close.textContent = "关闭";
+    close.style.cssText = "margin-top:12px;padding:6px 18px;border:1px solid #aaa;border-radius:6px;background:#fff;color:#18202a;font:16px/1.5 system-ui,sans-serif;cursor:pointer;";
+    close.addEventListener("click", () => dialog.close());
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      semanticPreviewDialog = null;
+      semanticPreviewText = null;
+    });
+    dialog.append(title, output, close);
+    document.documentElement.append(dialog);
+    semanticPreviewDialog = dialog;
+    semanticPreviewText = output;
+    refreshSemanticPreview();
+    dialog.showModal();
   }
 
   function resolveSemanticTimes() {
@@ -867,6 +1035,8 @@
   }
 
   function keepRangeVisible(range) {
+    // Reading continues behind the modal, but must not move the page being inspected.
+    if (semanticPreviewDialog?.open) return;
     const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
       ? range.startContainer
       : range.startContainer.parentElement;
@@ -977,6 +1147,7 @@
   }
 
   function requestAudio(endpoint, token, payload, serial) {
+    const preview = currentSemanticPreview;
     return new Promise((resolve, reject) => {
       const headers = { "Content-Type": "application/json" };
       if (token) headers.Authorization = `Bearer ${token}`;
@@ -991,7 +1162,7 @@
         headers,
         data: payload,
         responseType: "arraybuffer",
-        timeout: 45000,
+        timeout: 65000,
         onload(response) {
           if (serial !== requestSerial) {
             reject(new DOMException("已停止", "AbortError"));
@@ -1000,7 +1171,12 @@
           requestHandle = null;
           if (response.status >= 200 && response.status < 300) {
             try {
-              resolve(decodeTimedAudio(response.response, serial));
+              const source = response.responseHeaders?.match(/^X-Semantic-Source:\s*([^\r\n]+)/im)?.[1]?.trim();
+              const errorCode = response.responseHeaders?.match(/^X-Semantic-Error:\s*([^\r\n]+)/im)?.[1]?.trim();
+              setSemanticPreviewSource(preview, source, serial, errorCode);
+              const blob = decodeTimedAudio(response.response, serial);
+              finishSemanticPreview(preview, "complete", serial);
+              resolve(blob);
             } catch (error) {
               reject(error);
             }
@@ -1091,6 +1267,11 @@
   }
 
   function releasePlayback() {
+    if (currentSemanticPreview?.state === "receiving") {
+      currentSemanticPreview.state = "stopped";
+      refreshSemanticPreview();
+    }
+    currentSemanticPreview = null;
     const pending = requestHandle;
     requestHandle = null;
     try { pending?.abort?.(); } catch {}

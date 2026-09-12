@@ -13,7 +13,7 @@
 			"enabled": true
 		}
 	}
-	// Configure SEMANTIC_API_URL (full HTTPS /chat/completions or /responses URL) and
-	// SEMANTIC_MODEL as Worker variables, or add them to a vars object here.
+	// Set the semantic API URL and model in the userscript menu.
+	// Configure API_TOKEN to authenticate callers that choose the AI endpoint.
 	// Store SEMANTIC_API_TOKEN with: npx wrangler secret put SEMANTIC_API_TOKEN
 }
