@@ -428,7 +428,7 @@ async function synthesize(text, voice, rate, semantic = [], semanticSource = "di
       "Content-Type": TIMED_STREAM_TYPE,
       "X-Semantic-Source": semanticSource,
       ...(semanticErrorCode ? { "X-Semantic-Error": semanticErrorCode } : {}),
-      "Cache-Control": "no-store",
+      "Cache-Control": "public, max-age=36000, stale-while-revalidate=300",
       "X-Content-Type-Options": "nosniff",
     },
   });
