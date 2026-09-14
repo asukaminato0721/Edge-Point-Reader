@@ -15,8 +15,8 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
 - Support horizontal and vertical EPUB selections; ruby annotations are omitted
   from speech.
 - Highlight the word currently being spoken without changing the EPUB DOM.
-- Add meaning-based pauses (200 ms / 380 ms) using a user-configured AI API,
-  while synthesizing each full request as one continuous Edge utterance.
+- Split text into meaning chunks using a user-configured AI API, synthesize each
+  chunk separately, and wait 200 ms / 380 ms between clips. Prefetch the next clip.
 - While speech is playing, click any word in the selection to continue from
   that word.
 - Stream framed MP3 audio and word-boundary timing data with `fetch()` and
@@ -101,7 +101,7 @@ uses the Responses API; otherwise the Worker uses Chat Completions. Responses
 requests use `input` and read message `output_text` content, following the
 [Responses API format](https://developers.openai.com/api/reference/typescript/resources/beta/subresources/responses/methods/create).
 The userscript sends these settings as `semanticApiUrl` and `semanticModel` on
-each `/tts` request. Changes apply to the next reading session. The Worker does
+each segmentation request to `/tts`. Changes apply to the next reading session. The Worker does
 not read these settings from environment variables; no Workers AI binding is required.
 
 Store the provider token as a secret:
@@ -214,12 +214,24 @@ en-US-EmmaMultilingualNeural
 
 Rates must include a sign and percent suffix, such as `-20%`, `+0%`, or `+25%`.
 
-Semantic pauses add 200 ms at small boundaries and 380 ms at large boundaries,
-on top of Edge's own pauses. The text and DOM are unchanged. Word metadata maps
-each boundary to the next word's start; boundaries inside a word move to the next
-word. Seeking skips earlier boundaries and rearms later ones. Stopping or changing
-chunks cancels pending resume timers. These are browser playback pauses, so timing
-is approximate; background-tab throttling may cause pauses to be skipped.
+With semantic mode enabled, the Worker first returns an AI segmentation plan for
+one source chunk (up to 4,000 UTF-8 bytes). The userscript requests each meaning
+chunk as an independent Edge utterance with `semantic: false`, so the AI runs
+only once per source chunk. The first clip can stream through MediaSource; the
+next clip is prefetched and buffered while the current clip plays. At most one
+future clip is kept in memory.
+
+The current clip plays to its `ended` event, then the userscript waits 200 ms at a
+small boundary or 380 ms at a large boundary before starting the next clip.
+These waits add to Edge's own leading/trailing silence. Slow prefetches and
+background-tab timer throttling can make the interval longer. Independent clips
+can have different intonation from a whole-sentence synthesis.
+
+Word timings are mapped back to the original selection for highlighting and
+click-to-seek. Seeking into an earlier clip reuses its cached AI plan. Stopping
+or seeking to another clip cancels pending requests and transition timers.
+The original text and DOM are unchanged. Disabling semantic mode restores the
+original whole-chunk synthesis and streaming playback.
 
 ### Inspect the segmentation
 
@@ -232,17 +244,17 @@ Opening the dialog does not make another AI request or pause playback. Pressing
 Each request is labeled **AI 切分**, **AI 切分失败（未添加意义停顿）**, or
 **意义停顿已关闭**, including requests that return no boundaries. Failures report
 missing configuration, HTTP status, timeout, or output validation errors.
-Long selections show one entry per requested
-chunk. Clicking a word outside the current audio adds a new entry for that request.
+Long selections show one entry per source chunk, including the number of independent
+clips. Clicking a word in an already segmented chunk reuses the plan and preview;
+it does not request AI again. Audio request failures appear alongside the plan.
 Entries update as data arrives and remain available after playback ends or stops;
 interrupted requests are marked as such. Starting another reading replaces the
 entries, and reloading the page clears them. Preview text is kept only in memory.
 
-Update both the Worker and userscript for source labels. With an older Worker,
-the dialog reports **来源未知（请更新 Worker）** rather than guessing the source.
-If an older Worker reports punctuation fallback, the userscript ignores those
-boundaries and asks you to update the Worker.
-The preview confirms segmentation positions, not whether every pause was audible.
+Update both the Worker and userscript for segmented playback. An older Worker
+cannot return a segmentation plan; the preview will ask you to update it.
+The preview confirms the AI's received segmentation, not exact audible silence
+lengths or completion of every audio request.
 
 ## Worker API
 
@@ -266,8 +278,8 @@ curl https://YOUR_WORKER_HOST/tts \
 ```
 
 The response is a streamed
-`application/vnd.edge-point-reader.timed-stream` body. It is the only `/tts`
-response format; it is not a directly playable MP3. Each frame has a one-byte
+`application/vnd.edge-point-reader.timed-stream` body unless `segmentOnly` is
+requested. The timed stream is not a directly playable MP3. Each frame has a one-byte
 type, a four-byte big-endian payload length, and the payload:
 
 - Type `1`: MP3 bytes.
@@ -287,10 +299,29 @@ Successful TTS responses include `X-Semantic-Source: ai`, `failed`, or `disabled
 exposed through CORS. This header identifies the source even when no type `3`
 frames are returned. Failed segmentation also includes `X-Semantic-Error`, a
 diagnostic code such as `missing_token`, `http_400`, `timeout`, or `changed_text`.
-Both streaming and buffered playback use these headers for the preview. Provider
+Legacy timed-stream clients can use these headers for the preview. Provider
 response bodies and tokens are not included in diagnostics.
 
-Omit `semantic` or set it to `false` to skip the AI request and extra pauses.
+For segmented playback, send the same request with `semantic: true` and
+`segmentOnly: true`. This returns JSON without opening an Edge TTS connection:
+
+```json
+{
+  "mode": "segments",
+  "source": "ai",
+  "error": "",
+  "boundaries": [{ "offset": 3, "pauseMs": 200, "level": "small" }]
+}
+```
+
+On AI failure, `source` is `failed`, `error` contains the diagnostic code, and
+`boundaries` is empty. The userscript then reads the original source chunk once.
+For a valid plan, slice the original text at the received UTF-16 offsets and
+request each slice with `semantic: false` to get its independent timed stream.
+`segmentOnly: true` requires `semantic: true` and uses the same authentication
+and text-size checks as a normal synthesis request.
+
+Omit `semantic` or set it to `false` to skip the AI request.
 
 Limits and validation:
 
@@ -362,13 +393,13 @@ audio is playing and returns when playback ends or is stopped.
 Run the tests without external services or provider credentials:
 
 ```bash
-node tests/semantic.test.mjs
+node tests/segmented-playback.test.mjs
 node --check read-clipboard-edge-tts.js
 node --check read-clipboard-edge-tts.user.js
 ```
 
-The tests mock the provider, Edge socket, and browser media APIs. They check
-protocol handling and playback state; use a deployed Worker and a browser to
+The tests mock AI responses, browser media APIs, and word timings. They check
+segmentation requests, independent clips, prefetching, end-of-clip waits, and seeks; use a deployed Worker and a browser to
 evaluate actual Japanese segmentation and pause timing.
 
 ## Related projects

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.7.5
+// @version      1.8.0
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -55,9 +55,8 @@
   let wordFrame = 0;
   let highlightedWord = -1;
   let speechSession = null;
-  let semanticTimeline = [];
-  let semanticPauseTimer = null;
-  let semanticSeekOffset = -1;
+  const segmentRequests = new Set();
+  let segmentTransitionTimer = null;
   // Keep the last reading's received data in memory after playback stops.
   let semanticPreviewRecords = [];
   let currentSemanticPreview = null;
@@ -428,13 +427,24 @@
       textMap,
       words: new Map(),
       player: new Audio(),
+      plans: new Map(),
+      segmentPlan: null,
+      segmentIndex: 0,
+      prefetchedSegment: null,
+      openStream: null,
     };
 
+    // Start the first media element during the user's gesture, while AI prepares
+    // the plan. The first segment will feed this same MediaSource.
+    if (speechSession.semantic && canStreamMp3()) {
+      speechSession.openStream = createStreamPlayer(speechSession.player, serial);
+    }
     void playSpeechChunk(speechSession);
   }
 
   async function playSpeechChunk(session, textOffset) {
     if (speechSession !== session || session.serial !== requestSerial) return;
+    if (session.semantic) return playSegmentedChunk(session, textOffset);
     const serial = session.serial;
     const originalChunk = session.chunks[session.index];
     if (!originalChunk) return;
@@ -495,20 +505,217 @@
     }
   }
 
+  function segmentParts(chunk, boundaries) {
+    const parts = [];
+    let previous = 0;
+    for (const boundary of [...boundaries, { offset: chunk.text.length, pauseMs: 0 }]) {
+      const end = boundary.offset;
+      if (!Number.isInteger(end) || end <= previous || end > chunk.text.length ||
+          (end < chunk.text.length && /[\uD800-\uDBFF]/.test(chunk.text[end - 1]) &&
+            /[\uDC00-\uDFFF]/.test(chunk.text[end])) ||
+          !Number.isFinite(boundary.pauseMs) || boundary.pauseMs < 0 || boundary.pauseMs > 2000) {
+        throw new Error("Worker 返回了无效的分段位置");
+      }
+      const text = chunk.text.slice(previous, end);
+      if (text.trim()) {
+        parts.push({ text, start: chunk.start + previous, end: chunk.start + end, pauseAfter: boundary.pauseMs });
+      } else if (parts.length) {
+        parts.at(-1).pauseAfter = Math.max(parts.at(-1).pauseAfter, boundary.pauseMs);
+      }
+      previous = end;
+    }
+    if (parts.length) parts.at(-1).pauseAfter = 0;
+    return parts;
+  }
+
+  async function playSegmentedChunk(session, textOffset) {
+    const serial = session.serial;
+    const chunkIndex = session.index;
+    try {
+      let plan = session.plans.get(chunkIndex);
+      if (!plan) {
+        const chunk = session.chunks[chunkIndex];
+        const preview = {
+          text: chunk.text, start: chunk.start, chunkIndex, source: "pending",
+          state: "receiving", boundaries: [], mode: "segments",
+        };
+        currentSemanticPreview = preview;
+        semanticPreviewRecords.push(preview);
+        refreshSemanticPreview();
+        const result = await requestSegmentResource(session, {
+          text: chunk.text, voice: session.voice, rate: session.rate,
+          semantic: true, segmentOnly: true,
+          semanticApiUrl: session.semanticApiUrl, semanticModel: session.semanticModel,
+        }, true);
+        if (speechSession !== session || serial !== requestSerial) return;
+        if (result?.mode !== "segments" || !["ai", "failed"].includes(result.source) ||
+            !Array.isArray(result.boundaries)) throw new Error("请更新 Worker，以支持分段语音");
+        const boundaries = result.source === "ai" ? result.boundaries : [];
+        const parts = segmentParts(chunk, boundaries);
+        if (!parts.length) throw new Error("没有可朗读的意义块");
+        preview.boundaries = boundaries.map(({ offset, pauseMs, level }) => ({ offset, pauseMs, level }));
+        preview.source = result.source;
+        preview.error = semanticErrorDescription(result.error);
+        preview.state = "complete";
+        preview.partCount = parts.length;
+        plan = { parts, preview };
+        session.plans.set(chunkIndex, plan);
+        refreshSemanticPreview();
+      }
+      if (speechSession !== session || serial !== requestSerial) return;
+      session.segmentPlan = plan;
+      const index = textOffset == null ? 0 : plan.parts.findIndex((part) => part.end > textOffset);
+      session.segmentIndex = Math.max(0, index);
+      const part = plan.parts[session.segmentIndex];
+      const start = Math.max(part.start, textOffset ?? part.start);
+      await playSegment(session, { ...part, text: part.text.slice(start - part.start), start });
+    } catch (error) {
+      segmentPlaybackFailed(session, serial, error);
+    }
+  }
+
+  function segmentPlaybackFailed(session, serial, error) {
+    if (speechSession !== session || serial !== requestSerial || error?.name === "AbortError") return;
+    // Keep an already received AI plan available for inspection after TTS fails.
+    if (currentSemanticPreview?.state === "receiving") {
+      currentSemanticPreview.state = "failed";
+      currentSemanticPreview.source = "failed";
+      currentSemanticPreview.error = error?.message || String(error);
+    } else if (currentSemanticPreview) {
+      currentSemanticPreview.playbackError = error?.message || String(error);
+    }
+    fail(error?.message || String(error));
+  }
+
+  function segmentPayload(session, part) {
+    return { text: part.text, voice: session.voice, rate: session.rate, semantic: false };
+  }
+
+  async function playSegment(session, part = session.segmentPlan.parts[session.segmentIndex]) {
+    const serial = session.serial;
+    if (speechSession !== session || serial !== requestSerial) return;
+    const plan = session.segmentPlan;
+    const index = session.segmentIndex;
+    currentSemanticPreview = plan.preview;
+    prepareWordTracking(session.textMap, part);
+    try {
+      const cached = session.prefetchedSegment;
+      const useCached = cached?.plan === plan && cached.index === index && cached.start === part.start;
+      session.prefetchedSegment = null;
+      const preparedStream = session.openStream;
+      session.openStream = null;
+      if (!useCached && canStreamMp3()) {
+        const playing = streamAudio(session.endpoint, session.token,
+          JSON.stringify(segmentPayload(session, part)), serial, session.player, false, preparedStream);
+        prefetchNextSegment(session);
+        await playing;
+      } else {
+        const pending = useCached ? cached.promise
+          : requestSegmentResource(session, segmentPayload(session, part));
+        prefetchNextSegment(session);
+        const result = await pending;
+        if (speechSession !== session || serial !== requestSerial) return;
+        if (result?.error) throw result.error;
+        const blob = decodeTimedAudio(result, serial);
+        objectUrl = URL.createObjectURL(blob);
+        session.player.src = objectUrl;
+        startPlayer(session.player, serial);
+      }
+    } catch (error) {
+      segmentPlaybackFailed(session, serial, error);
+    }
+  }
+
+  function prefetchNextSegment(session) {
+    const plan = session.segmentPlan;
+    const index = session.segmentIndex + 1;
+    const part = plan.parts[index];
+    if (!part) return;
+    // Only one future clip is held in memory. Do not parse its word frames until
+    // playback reaches it, or it would replace the current word highlight map.
+    const promise = requestSegmentResource(session, segmentPayload(session, part))
+      .catch((error) => ({ error }));
+    session.prefetchedSegment = { plan, index, start: part.start, promise };
+  }
+
+  function requestSegmentResource(session, payload, planOnly = false) {
+    const serial = session.serial;
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== "function") {
+        reject(new Error("油猴未提供 GM_xmlhttpRequest"));
+        return;
+      }
+      const headers = { "Content-Type": "application/json" };
+      if (session.token) headers.Authorization = `Bearer ${session.token}`;
+      let handle;
+      const pending = { abort() {
+        segmentRequests.delete(pending);
+        reject(new DOMException("已停止", "AbortError"));
+        try { handle?.abort?.(); } catch {}
+      } };
+      segmentRequests.add(pending);
+      const done = (callback, value) => { segmentRequests.delete(pending); callback(value); };
+      try {
+        handle = GM_xmlhttpRequest({
+          method: "POST", url: session.endpoint, headers,
+          data: JSON.stringify(payload), responseType: "arraybuffer", timeout: 65000,
+          onload(response) {
+            if (speechSession !== session || serial !== requestSerial) {
+              done(reject, new DOMException("已停止", "AbortError"));
+              return;
+            }
+            try {
+              if (response.status < 200 || response.status >= 300) {
+                throw new Error(`TTS 请求失败：HTTP ${response.status}`);
+              }
+              const contentType = response.responseHeaders?.match(/^Content-Type:\s*([^\r\n]+)/im)?.[1] || "";
+              if (planOnly) {
+                if (!contentType.toLowerCase().includes("application/json")) {
+                  throw new Error("请更新 Worker，以支持分段语音");
+                }
+                done(resolve, JSON.parse(decoder.decode(new Uint8Array(response.response))));
+              } else {
+                if (!contentType.toLowerCase().includes(TIMED_STREAM_TYPE)) {
+                  throw new Error("Worker 没有返回逐词时间轴数据");
+                }
+                done(resolve, response.response);
+              }
+            } catch (error) { done(reject, error); }
+          },
+          onerror() { done(reject, new Error("无法连接 TTS Worker")); },
+          ontimeout() { done(reject, new Error("TTS 请求超时")); },
+          onabort() { done(reject, new DOMException("已停止", "AbortError")); },
+        });
+      } catch (error) { done(reject, error); }
+    });
+  }
+
+  function cancelSegmentTransition() {
+    clearTimeout(segmentTransitionTimer);
+    segmentTransitionTimer = null;
+  }
+
   function canStreamMp3() {
     return Boolean(globalThis.MediaSource?.isTypeSupported?.("audio/mpeg"));
   }
 
-  async function streamAudio(endpoint, token, payload, serial, player) {
-    const preview = currentSemanticPreview;
+  function createStreamPlayer(player, serial) {
     const controller = new AbortController();
     abortController = controller;
-
     const source = new MediaSource();
     mediaSource = source;
+    const opened = waitForEvent(source, "sourceopen", controller.signal);
+    // A stop can abort the opening while the segmentation request is pending.
+    void opened.catch(() => {});
     objectUrl = URL.createObjectURL(source);
     player.src = objectUrl;
     startPlayer(player, serial);
+    return { controller, source, opened };
+  }
+
+  async function streamAudio(endpoint, token, payload, serial, player, trackPreview = true, preparedStream = null) {
+    const preview = trackPreview ? currentSemanticPreview : null;
+    const { controller, source, opened } = preparedStream || createStreamPlayer(player, serial);
 
     const headers = { "Content-Type": "application/json" };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -521,7 +728,7 @@
         signal: controller.signal,
         cache: "no-store",
       }),
-      waitForEvent(source, "sourceopen", controller.signal),
+      opened,
     ]);
 
     if (!response.ok) {
@@ -585,10 +792,9 @@
     player.onended = () => finishPlayback(player);
     player.ontimeupdate = scheduleWordFrame;
     player.onplaying = () => {
-      clearSemanticPause();
       scheduleWordFrame();
     };
-    player.onseeking = () => resetSemanticSeek(player.currentTime);
+    player.onseeking = cancelSegmentTransition;
     player.onseeked = scheduleWordFrame;
     player.onpause = cancelWordFrame;
     player.onerror = () => {
@@ -739,7 +945,6 @@
     wordTimeline.push(word);
     // Keep DOM positions for earlier chunks after their audio is released.
     if (range) speechSession?.words.set(word.textOffset, word);
-    resolveSemanticTimes();
     scheduleWordFrame();
     return true;
   }
@@ -788,7 +993,6 @@
     wordFrame = 0;
     const player = audio;
     if (!player) return;
-    if (maybePauseAtSemanticBoundary(player)) return;
     setHighlightedWord(wordIndexAtTime(player.currentTime));
     if (!player.paused && !player.ended) {
       wordFrame = requestAnimationFrame(updateWordHighlight);
@@ -796,28 +1000,15 @@
   }
 
   function addSemanticBoundary(boundary, serial) {
-    if (serial !== requestSerial || !speechMap) return;
-    // Older Workers can still send punctuation fallback frames. Do not play them.
-    if (["fallback", "failed", "disabled"].includes(currentSemanticPreview?.source)) return;
-    const offset = boundary?.offset;
-    const pauseMs = boundary?.pauseMs;
+    // Kept for decoding older timed streams; this no longer pauses live audio.
+    if (serial !== requestSerial || !speechMap || !currentSemanticPreview ||
+        currentSemanticPreview.mode === "segments") return;
+    const { offset, pauseMs } = boundary || {};
     if (!Number.isInteger(offset) || offset <= 0 || offset >= speechMap.text.length ||
         !Number.isFinite(pauseMs) || pauseMs <= 0 || pauseMs > 2000) return;
-    const existing = semanticTimeline.find((item) => item.offset === offset);
-    if (existing) existing.pauseMs = Math.max(existing.pauseMs, pauseMs);
-    else {
-      semanticTimeline.push({
-        offset, pauseMs, level: boundary.level === "large" ? "large" : "small",
-        time: null, used: offset <= semanticSeekOffset,
-      });
-      semanticTimeline.sort((a, b) => a.offset - b.offset);
-    }
-    if (existing && boundary.level === "large") existing.level = "large";
-    if (currentSemanticPreview) {
-      currentSemanticPreview.boundaries = semanticTimeline.map(({ offset, pauseMs, level }) => ({ offset, pauseMs, level }));
-      refreshSemanticPreview();
-    }
-    resolveSemanticTimes();
+    if (["fallback", "failed", "disabled"].includes(currentSemanticPreview.source)) return;
+    currentSemanticPreview.boundaries.push({ offset, pauseMs, level: boundary.level === "large" ? "large" : "small" });
+    refreshSemanticPreview();
   }
 
   function setSemanticPreviewSource(preview, source, serial, errorCode) {
@@ -885,13 +1076,15 @@
           .map((boundary) => `${boundary.offset} → ${boundary.pauseMs}ms`).join("；")
         : ["failed", "fallback"].includes(record.source) ? "本段未添加意义停顿。"
           : record.state === "complete" ? "本段没有意义边界。" : "尚未收到意义边界。";
+      const playback = record.mode === "segments" && record.partCount ? `\n独立语音：${record.partCount} 块` : "";
+      const playbackError = record.playbackError ? `\n音频错误：${record.playbackError}` : "";
       const error = record.source === "failed" ? `\n原因：${record.error || "Worker 未提供错误详情，请更新 Worker。"}` : "";
       return `请求 ${index + 1} · 第 ${record.chunkIndex + 1} 段 · 选区偏移 ${record.start}\n` +
-        `${sources[record.source]} · ${states[record.state]}${error}\n\n${marked}\n\n${positions}`;
+        `${sources[record.source]} · ${states[record.state]}${playback}${error}${playbackError}\n\n${marked}\n\n${positions}`;
     });
     return "｜ 小边界（默认 200ms）  ‖ 大边界（默认 380ms）\n" +
       "以下为本次播放实际收到的切分，不会再次请求 AI。原文自带的 ｜ 和 ‖ 会保留。\n" +
-      "这里只确认切分位置；实际暂停会对齐到后一个词，后台播放可能跳过迟到的边界。\n\n" + sections.join("\n\n────────────\n\n");
+      "按意义块分别合成，当前块完整播放后再停顿；预加载未完成时等待会更长。\n\n" + sections.join("\n\n────────────\n\n");
   }
 
   function refreshSemanticPreview() {
@@ -940,64 +1133,6 @@
     semanticPreviewText = output;
     refreshSemanticPreview();
     dialog.showModal();
-  }
-
-  function resolveSemanticTimes() {
-    for (const boundary of semanticTimeline) {
-      if (boundary.time !== null) continue;
-      const nextWord = wordTimeline.find((word) => word.textStart >= boundary.offset);
-      if (!nextWord) continue;
-      boundary.time = nextWord.start;
-      // A seek can precede arrival of this word's metadata.
-      boundary.used ||= boundary.offset <= semanticSeekOffset ||
-        Boolean(audio && boundary.time < audio.currentTime - 0.12);
-    }
-  }
-
-  function clearSemanticPause() {
-    clearTimeout(semanticPauseTimer);
-    semanticPauseTimer = null;
-  }
-
-  function resetSemanticSeek(time) {
-    clearSemanticPause();
-    semanticSeekOffset = -1;
-    for (const word of wordTimeline) {
-      if (word.start <= time + 0.015) semanticSeekOffset = Math.max(semanticSeekOffset, word.textStart);
-    }
-    for (const boundary of semanticTimeline) {
-      boundary.used = boundary.offset <= semanticSeekOffset ||
-        (boundary.time !== null && boundary.time <= time + 0.015);
-    }
-  }
-
-  function maybePauseAtSemanticBoundary(player) {
-    if (semanticPauseTimer !== null || player.paused || player.ended || player.seeking) return false;
-    const current = player.currentTime;
-    let pauseMs = 0;
-    for (const boundary of semanticTimeline) {
-      if (boundary.used || boundary.time === null || current < boundary.time - 0.015) continue;
-      boundary.used = true;
-      // Skip stale metadata or background-tab delays; never rewind audible speech.
-      if (current <= boundary.time + 0.12) pauseMs = Math.max(pauseMs, boundary.pauseMs);
-    }
-    if (!pauseMs) return false;
-    const session = speechSession;
-    const serial = requestSerial;
-    player.pause();
-    const timer = setTimeout(() => {
-      if (semanticPauseTimer !== timer) return;
-      semanticPauseTimer = null;
-      if (audio !== player || !session || speechSession !== session ||
-          requestSerial !== serial || !player.paused || player.ended) return;
-      void player.play().catch((error) => {
-        if (audio === player && requestSerial === serial && error?.name !== "AbortError") {
-          fail(error?.message || "浏览器阻止了音频播放");
-        }
-      });
-    }, pauseMs);
-    semanticPauseTimer = timer;
-    return true;
   }
 
   function wordIndexAtTime(time) {
@@ -1125,7 +1260,7 @@
     const player = audio;
     if (!player) return;
     try {
-      resetSemanticSeek(word.start);
+      cancelSegmentTransition();
       player.currentTime = Math.max(0, word.start);
       setHighlightedWord(index);
       if (player.paused) void player.play();
@@ -1136,9 +1271,6 @@
 
   function clearWordTracking() {
     cancelWordFrame();
-    clearSemanticPause();
-    semanticTimeline = [];
-    semanticSeekOffset = -1;
     globalThis.CSS?.highlights?.delete?.("edge-point-reader-word");
     speechMap = null;
     wordTimeline = [];
@@ -1229,6 +1361,19 @@
     clearWordTracking();
 
     const session = speechSession;
+    if (session?.semantic && session.serial === requestSerial &&
+        session.segmentIndex + 1 < session.segmentPlan.parts.length) {
+      const delay = session.segmentPlan.parts[session.segmentIndex].pauseAfter;
+      const serial = session.serial;
+      session.segmentIndex++;
+      const timer = setTimeout(() => {
+        if (segmentTransitionTimer !== timer) return;
+        segmentTransitionTimer = null;
+        if (speechSession === session && requestSerial === serial) void playSegment(session);
+      }, delay);
+      segmentTransitionTimer = timer;
+      return;
+    }
     if (session && session.serial === requestSerial && session.index + 1 < session.chunks.length) {
       session.index++;
       void playSpeechChunk(session);
@@ -1267,6 +1412,12 @@
   }
 
   function releasePlayback() {
+    cancelSegmentTransition();
+    for (const pending of segmentRequests) pending.abort();
+    if (speechSession) {
+      speechSession.prefetchedSegment = null;
+      speechSession.openStream = null;
+    }
     if (currentSemanticPreview?.state === "receiving") {
       currentSemanticPreview.state = "stopped";
       refreshSemanticPreview();

@@ -121,6 +121,9 @@ export default {
     if (!/^[+-](?:100|[0-9]{1,2})%$/.test(rate)) {
       return json({ error: "rate must be between -100% and +100%" }, 400);
     }
+    if (input?.segmentOnly === true && input?.semantic !== true) {
+      return json({ error: "segmentOnly requires semantic: true" }, 400);
+    }
     // Only authenticated callers may choose where the Worker sends its AI secret.
     if (input?.semantic === true && env.SEMANTIC_API_TOKEN && !env.API_TOKEN) {
       return json({ error: "Configure API_TOKEN before using a user-selected semantic API URL" }, 400);
@@ -143,6 +146,11 @@ export default {
           console.warn("Semantic chunking failed; no extra pauses:", semanticErrorCode);
           semanticSource = "failed";
         }
+      }
+      // The userscript requests this plan once, then synthesizes each part with
+      // semantic:false. Keep the existing timed stream for older clients.
+      if (input?.segmentOnly === true) {
+        return json({ mode: "segments", boundaries, source: semanticSource, error: semanticErrorCode });
       }
       return await synthesize(text, voice, rate, boundaries, semanticSource, semanticErrorCode);
     } catch (error) {
