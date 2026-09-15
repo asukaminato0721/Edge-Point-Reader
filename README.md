@@ -4,7 +4,9 @@ Edge Point Reader adds Edge-style selection-to-read speech to normal web pages
 on Linux. A userscript shows a small read badge beside selected text, while a
 Cloudflare Worker streams Microsoft Edge neural TTS audio back to the browser.
 
-The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
+The default voice is `ja-JP-NanamiNeural` at `-7%` rate and `-4Hz` pitch.
+Long Japanese clauses can receive a small punctuation pause; random rate
+variation is off by default.
 
 ## Features
 
@@ -23,7 +25,8 @@ The default voice is `ja-JP-NanamiNeural` at `-20%` rate.
   `MediaSource` for faster startup.
 - Fall back to buffered playback of the same framed stream when MP3
   `MediaSource` is unavailable.
-- Configure the Worker endpoint, API token, voice, and rate from the userscript
+- Configure the Worker endpoint, API token, voice, rate, pitch, and optional
+  rate variation from the userscript
   menu.
 - Stop the request and playback immediately with `Esc` or the userscript menu.
 
@@ -198,7 +201,11 @@ The userscript menu provides:
 - **Set semantic API URL**
 - **Set semantic model**
 - **Set voice**
-- **Set rate (for example -20%)**
+- **Set rate (for example -7%)**
+- **Set pitch (for example -4Hz)**
+- **Set rate variation (0-3 percentage points)**: defaults to `0` (off).
+- **切换日语自然分句标点（下次朗读生效）**: toggle conservative pause
+  punctuation, enabled by default for Japanese voices.
 - **切换意义停顿（下次朗读生效）**: toggle semantic pauses, enabled by default.
 - **查看本次切分**: inspect the boundaries received for the current or last reading.
 - **停止朗读**
@@ -212,7 +219,15 @@ zh-CN-XiaoxiaoNeural
 en-US-EmmaMultilingualNeural
 ```
 
-Rates must include a sign and percent suffix, such as `-20%`, `+0%`, or `+25%`.
+Rates must include a sign and percent suffix, such as `-7%`, `+0%`, or `+25%`.
+Pitch uses signed hertz, such as `-4Hz` or `+0Hz`. If a rate was previously
+saved in the userscript menu, that saved value still takes priority; set it to
+`-7%` to use the new baseline.
+
+The punctuation rule only inserts `、` after recognized clause endings such as
+`けれど` or `言ったが` when both sides are long enough and there is no existing
+punctuation. It does not rewrite words, selected page text, or semantic AI
+boundaries. Very short words and example sentences usually stay unchanged.
 
 With semantic mode enabled, the Worker first returns an AI segmentation plan for
 one source chunk (up to 4,000 UTF-8 bytes). The userscript requests each meaning
@@ -269,13 +284,36 @@ curl https://YOUR_WORKER_HOST/tts \
   --data '{
     "text": "こんにちは。",
     "voice": "ja-JP-NanamiNeural",
-    "rate": "-20%",
+    "rate": "-7%",
+    "pitch": "-4Hz",
+    "rateJitter": 0,
+    "humanizeJa": true,
     "semantic": true,
     "semanticApiUrl": "https://YOUR_AI_HOST/v1/chat/completions",
     "semanticModel": "YOUR_MODEL_ID"
   }' \
   --output speech.epr
 ```
+
+The optional JSON body fields are:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `rate` | `"-7%"` | Edge prosody rate; an explicit older value still works. |
+| `pitch` | `"-4Hz"` | Edge prosody pitch. |
+| `rateJitter` | `0` | Integer `0` to `3`; adds a random ± number of percentage points to the rate for each synthesis request. `0` is deterministic. |
+| `humanizeJa` | `true` for `ja-JP-` voices | Insert conservative `、` pauses in longer Japanese clauses before synthesis. Set `false` for exact text. |
+
+`POST /tts` keeps the existing JSON request and timed-stream response. It does
+not take these settings from URL query parameters. `segmentOnly: true` still
+returns the original source-text offsets; the pause punctuation applies only
+to subsequent audio synthesis requests.
+
+For an existing Yomitan adapter that already calls `/tts`, pass `pitch`,
+`rateJitter`, and `humanizeJa` in the same JSON body as `text`, `voice`, and
+`rate`. The adapter must continue decoding the existing timed stream. For
+example, `{"text":"彼はそう言ったが私は信じなかった。","voice":"ja-JP-NanamiNeural","rate":"-7%","pitch":"-4Hz","rateJitter":0,"humanizeJa":true}`.
+No change to Yomitan's own audio-source configuration is required.
 
 The response is a streamed
 `application/vnd.edge-point-reader.timed-stream` body unless `segmentOnly` is
@@ -329,6 +367,8 @@ Limits and validation:
   splits longer selections into consecutive requests.
 - Voice names may contain letters, digits, and hyphens.
 - Rate must be between `-100%` and `+100%`.
+- Pitch must be between `-50Hz` and `+50Hz`.
+- `rateJitter` must be an integer from `0` to `3`; `humanizeJa` must be boolean.
 
 ## Troubleshooting
 
@@ -393,14 +433,14 @@ audio is playing and returns when playback ends or is stopped.
 Run the tests without external services or provider credentials:
 
 ```bash
-node tests/segmented-playback.test.mjs
+node tests/natural-speech.test.mjs
 node --check read-clipboard-edge-tts.js
 node --check read-clipboard-edge-tts.user.js
 ```
 
-The tests mock AI responses, browser media APIs, and word timings. They check
-segmentation requests, independent clips, prefetching, end-of-clip waits, and seeks; use a deployed Worker and a browser to
-evaluate actual Japanese segmentation and pause timing.
+The test mocks the Edge WebSocket to check default and explicit prosody,
+punctuation boundaries, request validation, and the unchanged `/tts` stream
+type. Use a deployed Worker and a browser to judge actual voice naturalness.
 
 ## Related projects
 

@@ -34,7 +34,8 @@ const EDGE_ENDPOINT =
 const EDGE_EXTENSION_ORIGIN =
   "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold";
 const DEFAULT_VOICE = "ja-JP-NanamiNeural";
-const DEFAULT_RATE = "-20%";
+const DEFAULT_RATE = "-7%";
+const DEFAULT_PITCH = "-4Hz";
 const MAX_TEXT_BYTES = 4000;
 const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
 const FRAME_AUDIO = 1;
@@ -110,6 +111,9 @@ export default {
     const text = cleanText(input?.text);
     const voice = typeof input?.voice === "string" ? input.voice : DEFAULT_VOICE;
     const rate = typeof input?.rate === "string" ? input.rate : DEFAULT_RATE;
+    const pitch = typeof input?.pitch === "string" ? input.pitch : DEFAULT_PITCH;
+    const rateJitter = input?.rateJitter ?? 0;
+    const humanizeJa = input?.humanizeJa ?? voice.startsWith("ja-JP-");
 
     if (!text) return json({ error: "text is required" }, 400);
     if (new TextEncoder().encode(input.text).byteLength > MAX_TEXT_BYTES) {
@@ -120,6 +124,15 @@ export default {
     }
     if (!/^[+-](?:100|[0-9]{1,2})%$/.test(rate)) {
       return json({ error: "rate must be between -100% and +100%" }, 400);
+    }
+    if (!/^[+-](?:[0-9]|[1-4][0-9]|50)Hz$/.test(pitch)) {
+      return json({ error: "pitch must be between -50Hz and +50Hz" }, 400);
+    }
+    if (!Number.isInteger(rateJitter) || rateJitter < 0 || rateJitter > 3) {
+      return json({ error: "rateJitter must be an integer from 0 to 3" }, 400);
+    }
+    if (typeof humanizeJa !== "boolean") {
+      return json({ error: "humanizeJa must be true or false" }, 400);
     }
     if (input?.segmentOnly === true && input?.semantic !== true) {
       return json({ error: "segmentOnly requires semantic: true" }, 400);
@@ -152,7 +165,10 @@ export default {
       if (input?.segmentOnly === true) {
         return json({ mode: "segments", boundaries, source: semanticSource, error: semanticErrorCode });
       }
-      return await synthesize(text, voice, rate, boundaries, semanticSource, semanticErrorCode);
+      const spokenText = humanizeJa && voice.startsWith("ja-JP-")
+        ? humanizeJapanese(text) : text;
+      return await synthesize(spokenText, voice, variedRate(rate, rateJitter), pitch,
+        boundaries, semanticSource, semanticErrorCode, rateJitter > 0);
     } catch (error) {
       return json(
         { error: "Edge TTS request failed", detail: String(error?.message || error) },
@@ -175,6 +191,46 @@ function cleanText(value) {
     .replace(/[\t \f\v]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// Insert pauses only at recognizable clause endings in longer Japanese prose.
+// This does not edit the source text used by the userscript's DOM word mapping.
+function humanizeJapanese(text) {
+  const endings = /(?:けれども|けれど|けど|ましたが|でしたが|だったが|ていたが|ったが|たので|るので)/g;
+  let result = "";
+  let last = 0;
+  let phraseStart = 0;
+  for (const match of text.matchAll(endings)) {
+    const end = match.index + match[0].length;
+    const left = text.slice(phraseStart, match.index);
+    const lastPunctuation = Math.max(...[...left.matchAll(/[、。！？…\n]/g)]
+      .map((item) => item.index), -1);
+    if (lastPunctuation >= 0) phraseStart += lastPunctuation + 1;
+    const before = text.slice(phraseStart, match.index);
+    const next = text[end] || "";
+    const following = text.slice(end).split(/[、。！？…\n]/, 1)[0];
+    // A full clause on the left and a continuing phrase on the right are required.
+    // Exclude existing punctuation and short fragments on either side.
+    const insert = before.length >= 8 && following.length >= 5 &&
+      next && !/[、。！？…\n\s]/.test(next) &&
+      !/[、。！？…\n]/.test(text[end - 1]) &&
+      !/[、。！？…\n]/.test(text[match.index - 1] || "");
+    if (insert) {
+      result += text.slice(last, end) + "、";
+      last = end;
+      phraseStart = end;
+    }
+  }
+  return result + text.slice(last);
+}
+
+function variedRate(rate, jitter) {
+  if (!jitter) return rate;
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  const delta = random[0] % (2 * jitter + 1) - jitter;
+  const value = Math.max(-100, Math.min(100, Number.parseInt(rate, 10) + delta));
+  return `${value >= 0 ? "+" : ""}${value}%`;
 }
 
 async function semanticBoundaries(text, apiUrl, model, token) {
@@ -276,7 +332,7 @@ function semanticBoundary(offset, large) {
   return { offset, pauseMs: large ? 380 : 200, level: large ? "large" : "small" };
 }
 
-async function synthesize(text, voice, rate, semantic = [], semanticSource = "disabled", semanticErrorCode = "") {
+async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false) {
   let handshake = await connectToEdge();
 
   // A 403 is commonly a clock-skew error. Retry once using Microsoft's Date.
@@ -411,7 +467,7 @@ async function synthesize(text, voice, rate, semantic = [], semanticSource = "di
   const requestId = randomHex(16).toLowerCase();
   const ssml =
     "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
-    `<voice name='${voice}'><prosody pitch='+0Hz' rate='${rate}' volume='+0%'>` +
+    `<voice name='${voice}'><prosody pitch='${pitch}' rate='${rate}' volume='+0%'>` +
     `${escapeXml(text)}</prosody></voice></speak>`;
   socket.send(
     `X-RequestId:${requestId}\r\n` +
@@ -428,7 +484,7 @@ async function synthesize(text, voice, rate, semantic = [], semanticSource = "di
       "Content-Type": TIMED_STREAM_TYPE,
       "X-Semantic-Source": semanticSource,
       ...(semanticErrorCode ? { "X-Semantic-Error": semanticErrorCode } : {}),
-      "Cache-Control": "public, max-age=36000, stale-while-revalidate=300",
+      "Cache-Control": noCache ? "no-store" : "public, max-age=36000, stale-while-revalidate=300",
       "X-Content-Type-Options": "nosniff",
     },
   });

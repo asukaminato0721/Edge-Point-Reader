@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.8.0
+// @version      1.9.0
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -200,8 +200,15 @@
   registerMenu("Set semantic API URL", "semanticApiUrl", SEMANTIC_API_URL);
   registerMenu("Set semantic model", "semanticModel", SEMANTIC_MODEL);
   registerMenu("Set voice", "voice", "ja-JP-NanamiNeural");
-  registerMenu("Set rate (for example -20%)", "rate", "-20%");
+  registerMenu("Set rate (for example -7%)", "rate", "-7%");
+  registerMenu("Set pitch (for example -4Hz)", "pitch", "-4Hz");
+  registerMenu("Set rate variation (0-3 percentage points)", "rateJitter", "0");
   if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("切换日语自然分句标点（下次朗读生效）", () => {
+      const enabled = !getValue("humanizeJa", true);
+      setValue("humanizeJa", enabled);
+      alert(`日语自然分句标点已${enabled ? "开启" : "关闭"}，下次朗读生效`);
+    });
     GM_registerMenuCommand("查看本次切分", showSemanticPreview);
     GM_registerMenuCommand("切换意义停顿（下次朗读生效）", () => {
       const enabled = !getValue("semantic", true);
@@ -418,7 +425,10 @@
       endpoint,
       token: getValue("token", ""),
       voice: getValue("voice", "ja-JP-NanamiNeural"),
-      rate: getValue("rate", "-20%"),
+      rate: getValue("rate", "-7%"),
+      pitch: getValue("pitch", "-4Hz"),
+      rateJitter: Number(getValue("rateJitter", "0")),
+      humanizeJa: getValue("humanizeJa", true),
       semantic: getValue("semantic", true),
       semanticApiUrl: getValue("semanticApiUrl", SEMANTIC_API_URL),
       semanticModel: getValue("semanticModel", SEMANTIC_MODEL),
@@ -470,6 +480,9 @@
       text: chunk.text,
       voice: session.voice,
       rate: session.rate,
+      pitch: session.pitch,
+      rateJitter: session.rateJitter,
+      humanizeJa: session.humanizeJa,
       semantic: session.semantic,
       semanticApiUrl: session.semanticApiUrl,
       semanticModel: session.semanticModel,
@@ -544,6 +557,7 @@
         refreshSemanticPreview();
         const result = await requestSegmentResource(session, {
           text: chunk.text, voice: session.voice, rate: session.rate,
+          pitch: session.pitch, rateJitter: session.rateJitter, humanizeJa: session.humanizeJa,
           semantic: true, segmentOnly: true,
           semanticApiUrl: session.semanticApiUrl, semanticModel: session.semanticModel,
         }, true);
@@ -588,7 +602,10 @@
   }
 
   function segmentPayload(session, part) {
-    return { text: part.text, voice: session.voice, rate: session.rate, semantic: false };
+    return {
+      text: part.text, voice: session.voice, rate: session.rate, pitch: session.pitch,
+      rateJitter: session.rateJitter, humanizeJa: session.humanizeJa, semantic: false,
+    };
   }
 
   async function playSegment(session, part = session.segmentPlan.parts[session.segmentIndex]) {
@@ -926,9 +943,20 @@
     let textStart = -1;
     let range = null;
     if (speechMap) {
-      textStart = speechMap.text.indexOf(text, wordSearchOffset);
+      let matchedText = text;
+      textStart = speechMap.text.indexOf(matchedText, wordSearchOffset);
+      // Edge can attach newly inserted pause punctuation to a word boundary.
+      // Fall back to the same word without that trailing punctuation so DOM
+      // offsets continue to refer to the untouched selection.
+      if (textStart < 0) {
+        const withoutPause = text.replace(/^、|、$/g, "");
+        if (withoutPause && withoutPause !== text) {
+          matchedText = withoutPause;
+          textStart = speechMap.text.indexOf(matchedText, wordSearchOffset);
+        }
+      }
       if (textStart >= 0) {
-        wordSearchOffset = textStart + text.length;
+        wordSearchOffset = textStart + matchedText.length;
         range = rangeForTextOffsets(textStart, wordSearchOffset);
       }
     }
