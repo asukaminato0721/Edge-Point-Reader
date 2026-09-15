@@ -12,7 +12,10 @@
 		"traces": {
 			"enabled": true
 		}
-	}
+    },
+    "cache": {
+        "enabled": true
+    }
 	// Set the semantic API URL and model in the userscript menu.
 	// Configure API_TOKEN to authenticate callers that choose the AI endpoint.
 	// Store SEMANTIC_API_TOKEN with: npx wrangler secret put SEMANTIC_API_TOKEN
