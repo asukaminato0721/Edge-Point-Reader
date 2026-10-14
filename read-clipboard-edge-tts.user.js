@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.9.0
+// @version      1.9.1
 // @description  Stream Edge neural speech with word tracking for selected text
 // @match        http://*/*
 // @match        https://*/*
@@ -820,6 +820,10 @@
 
     // This is called before the first await, while the click still counts as a
     // user gesture. MediaSource will feed audio to the pending player shortly.
+    resumePlayer(player, serial);
+  }
+
+  function resumePlayer(player, serial) {
     void player.play().then(
       undefined,
       (error) => {
@@ -1291,7 +1295,7 @@
       cancelSegmentTransition();
       player.currentTime = Math.max(0, word.start);
       setHighlightedWord(index);
-      if (player.paused) void player.play();
+      if (player.paused) resumePlayer(player, requestSerial);
     } catch (error) {
       console.warn("[Edge 点读] 无法跳到所点文字", error);
     }

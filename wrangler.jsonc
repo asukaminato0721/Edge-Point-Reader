@@ -6,6 +6,9 @@
 		"mode": "smart"
 	},
 	"observability": {
+		"issues": {
+			"enabled": true
+		},
 		"logs": {
 			"enabled": true
 		},

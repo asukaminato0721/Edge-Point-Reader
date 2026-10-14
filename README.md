@@ -33,6 +33,7 @@ variation is off by default.
 ## Files
 
 - `read-clipboard-edge-tts.js`: Cloudflare Module Worker and Edge TTS proxy.
+- `edge-tts-gec.js`: v2 authentication token implementation for the Worker.
 - `read-clipboard-edge-tts.user.js`: standalone Tampermonkey/Violentmonkey
   userscript.
 - `wrangler.jsonc`: Worker deployment configuration.
@@ -383,10 +384,17 @@ not match. Set it again from the userscript menu.
 
 ### HTTP 502, 403, or 503
 
-Microsoft's Edge speech endpoint is unofficial and can reject or temporarily
-throttle connections. Check that the Worker clock and compatibility date are
-current, then retry. A Microsoft protocol change may require updating the
-Chromium version and token-generation constants in the Worker.
+Microsoft's Edge speech endpoint can reject or temporarily throttle connections.
+If the response says `WebSocket handshake returned HTTP 403`, update the Worker
+and deploy it again. Microsoft changed the `Sec-MS-GEC` authentication to v2 in
+October 2026. This Worker uses the algorithm from
+[`edge-tts 7.3.0`](https://github.com/rany2/edge-tts/releases/tag/7.3.0).
+Changing only the Chromium version does not fix an old token algorithm.
+The Worker retries a 403 once with the time from Microsoft's `Date` header.
+
+`edge-tts-gec.js` contains the v2 token implementation. Deploy it together with
+`read-clipboard-edge-tts.js` through Wrangler. The port uses the upstream LGPLv3
+license. See `LICENSES/edge-tts.txt`.
 
 ### Playback starts slowly
 
@@ -433,14 +441,16 @@ audio is playing and returns when playback ends or is stopped.
 Run the tests without external services or provider credentials:
 
 ```bash
-node tests/natural-speech.test.mjs
+node --test tests/*.test.mjs
+node --check edge-tts-gec.js
 node --check read-clipboard-edge-tts.js
 node --check read-clipboard-edge-tts.user.js
 ```
 
-The test mocks the Edge WebSocket to check default and explicit prosody,
-punctuation boundaries, request validation, and the unchanged `/tts` stream
-type. Use a deployed Worker and a browser to judge actual voice naturalness.
+The tests compare v2 tokens with reference outputs from `edge-tts 7.3.0`.
+They mock the Edge WebSocket to check authentication, clock correction, default
+prosody, audio frames, and word frames. They also check playback error handling
+after a word click. Use a deployed Worker and a browser to check actual speech.
 
 ## Related projects
 

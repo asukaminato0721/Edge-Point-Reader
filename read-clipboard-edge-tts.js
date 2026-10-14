@@ -25,10 +25,11 @@
  * constants, not deployment-specific URLs.
  */
 
-const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+import { secMsGec, TRUSTED_CLIENT_TOKEN } from "./edge-tts-gec.js";
+
 const CHROMIUM_FULL_VERSION = "143.0.3650.75";
 const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
-const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
+const SEC_MS_GEC_VERSION = `2-${CHROMIUM_FULL_VERSION}`;
 const EDGE_ENDPOINT =
   "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 const EDGE_EXTENSION_ORIGIN =
@@ -335,7 +336,7 @@ function semanticBoundary(offset, large) {
 async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false) {
   let handshake = await connectToEdge();
 
-  // A 403 is commonly a clock-skew error. Retry once using Microsoft's Date.
+  // Clock skew can cause a 403. Retry once using Microsoft's Date.
   if (!handshake.webSocket && handshake.status === 403) {
     const serverDate = Date.parse(handshake.headers.get("Date") || "");
     if (Number.isFinite(serverDate)) {
@@ -515,14 +516,6 @@ async function connectToEdge(unixSeconds = Math.floor(Date.now() / 1000)) {
       Cookie: `muid=${randomHex(16)};`,
     },
   });
-}
-
-async function secMsGec(unixSeconds) {
-  const rounded = BigInt(unixSeconds - (unixSeconds % 300));
-  const windowsTicks = (rounded + 11644473600n) * 10000000n;
-  const data = new TextEncoder().encode(`${windowsTicks}${TRUSTED_CLIENT_TOKEN}`);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return bytesToHex(new Uint8Array(digest));
 }
 
 function randomHex(byteLength) {
