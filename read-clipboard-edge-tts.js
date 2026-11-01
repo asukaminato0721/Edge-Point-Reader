@@ -26,6 +26,7 @@
  */
 
 import { secMsGec, TRUSTED_CLIENT_TOKEN } from "./edge-tts-gec.js";
+import { connectToTranslator } from "./microsoft-translator.js";
 
 const CHROMIUM_FULL_VERSION = "143.0.3650.75";
 const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
@@ -110,9 +111,15 @@ export default {
     }
 
     const text = cleanText(input?.text);
-    const voice = typeof input?.voice === "string" ? input.voice : DEFAULT_VOICE;
+    // Requests from older userscripts omit provider and keep using Edge.
+    const provider = input?.provider ?? "edge";
+    if (provider !== "edge" && provider !== "microsoft-translator") {
+      return json({ error: "provider must be edge or microsoft-translator" }, 400);
+    }
+    const translator = provider === "microsoft-translator";
+    const voice = typeof input?.voice === "string" ? input.voice : translator ? "ja-JP-MayuNeural" : DEFAULT_VOICE;
     const rate = typeof input?.rate === "string" ? input.rate : DEFAULT_RATE;
-    const pitch = typeof input?.pitch === "string" ? input.pitch : DEFAULT_PITCH;
+    const pitch = typeof input?.pitch === "string" ? input.pitch : translator ? "+0st" : DEFAULT_PITCH;
     const rateJitter = input?.rateJitter ?? 0;
     const humanizeJa = input?.humanizeJa ?? voice.startsWith("ja-JP-");
 
@@ -126,7 +133,10 @@ export default {
     if (!/^[+-](?:100|[0-9]{1,2})%$/.test(rate)) {
       return json({ error: "rate must be between -100% and +100%" }, 400);
     }
-    if (!/^[+-](?:[0-9]|[1-4][0-9]|50)Hz$/.test(pitch)) {
+    if (translator && (!/^[+-][0-9]{1,2}st$/.test(pitch) || Number.parseInt(pitch, 10) < -12 || Number.parseInt(pitch, 10) > 7)) {
+      return json({ error: "Translator pitch must be between -12st and +7st" }, 400);
+    }
+    if (!translator && !/^[+-](?:[0-9]|[1-4][0-9]|50)Hz$/.test(pitch)) {
       return json({ error: "pitch must be between -50Hz and +50Hz" }, 400);
     }
     if (!Number.isInteger(rateJitter) || rateJitter < 0 || rateJitter > 3) {
@@ -169,10 +179,10 @@ export default {
       const spokenText = humanizeJa && voice.startsWith("ja-JP-")
         ? humanizeJapanese(text) : text;
       return await synthesize(spokenText, voice, variedRate(rate, rateJitter), pitch,
-        boundaries, semanticSource, semanticErrorCode, rateJitter > 0);
+        boundaries, semanticSource, semanticErrorCode, rateJitter > 0, provider);
     } catch (error) {
       return json(
-        { error: "Edge TTS request failed", detail: String(error?.message || error) },
+        { error: "Speech request failed", detail: String(error?.message || error) },
         502,
       );
     }
@@ -333,11 +343,12 @@ function semanticBoundary(offset, large) {
   return { offset, pauseMs: large ? 380 : 200, level: large ? "large" : "small" };
 }
 
-async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false) {
-  let handshake = await connectToEdge();
+async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
+  const translator = provider === "microsoft-translator";
+  let handshake = await (translator ? connectToTranslator() : connectToEdge());
 
   // Clock skew can cause a 403. Retry once using Microsoft's Date.
-  if (!handshake.webSocket && handshake.status === 403) {
+  if (!translator && !handshake.webSocket && handshake.status === 403) {
     const serverDate = Date.parse(handshake.headers.get("Date") || "");
     if (Number.isFinite(serverDate)) {
       handshake = await connectToEdge(Math.floor(serverDate / 1000));
@@ -355,6 +366,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
   let controller;
   let completed = false;
   let receivedAudio = false;
+  let audioBytes = 0;
   let timeoutId;
   let pendingBinary = Promise.resolve();
 
@@ -395,17 +407,19 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
       if (completed) return;
       const buffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
       const packet = new Uint8Array(buffer);
-      if (packet.byteLength < 2) throw new Error("Invalid Edge TTS audio packet");
+      if (packet.byteLength < 2) throw new Error("Invalid speech audio packet");
 
       const headerLength = (packet[0] << 8) | packet[1];
       const audioStart = 2 + headerLength;
       if (audioStart > packet.byteLength) throw new Error("Invalid audio header length");
 
       const headers = new TextDecoder().decode(packet.subarray(2, audioStart));
-      if (protocolPath(headers) !== "audio") return;
+      if (protocolPath(headers) !== "audio") throw new Error("Invalid speech audio headers");
 
       const audio = packet.slice(audioStart);
       if (audio.byteLength) {
+        audioBytes += audio.byteLength;
+        if (audioBytes > 16 * 1024 * 1024) throw new Error("Speech audio exceeds 16 MiB");
         receivedAudio = true;
         controller.enqueue(streamFrame(FRAME_AUDIO, audio));
       }
@@ -435,7 +449,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
           path !== "response" &&
           path !== "turn.start"
         ) {
-          throw new Error(`Unexpected Edge TTS message: ${path}`);
+          throw new Error(`Unexpected speech message: ${path}`);
         }
         return;
       }
@@ -445,39 +459,50 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
     }
   });
 
-  socket.addEventListener("error", () => finish(new Error("Edge TTS WebSocket error")));
+  socket.addEventListener("error", () => finish(new Error("Speech WebSocket error")));
   socket.addEventListener("close", () => {
     if (!completed) {
       pendingBinary.then(
-        () => finish(receivedAudio ? undefined : new Error("Edge TTS closed early")),
+        () => finish(new Error("Speech connection closed before turn.end")),
         finish,
       );
     }
   });
 
-  const timestamp = edgeTimestamp();
+  const timestamp = translator ? new Date().toISOString() : edgeTimestamp();
+  const requestId = randomHex(16).toLowerCase();
   socket.send(
+    (translator ? `X-RequestId:${requestId}\r\n` : "") +
     `X-Timestamp:${timestamp}\r\n` +
       "Content-Type:application/json; charset=utf-8\r\n" +
       "Path:speech.config\r\n\r\n" +
+      (translator ? JSON.stringify({ context: { system: { name: "Edge Point Reader", version: "2.0.0" } } }) :
       '{"context":{"synthesis":{"audio":{"metadataoptions":{' +
       '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},' +
-      '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n',
+      '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n'),
   );
 
-  const requestId = randomHex(16).toLowerCase();
+  if (translator) socket.send(
+    `X-RequestId:${requestId}\r\nX-Timestamp:${timestamp}\r\n` +
+    "Content-Type:application/json\r\nPath:synthesis.context\r\n\r\n" +
+    JSON.stringify({ synthesis: { audio: { metadataOptions: {
+      bookmarkEnabled: false, punctuationBoundaryEnabled: false,
+      sentenceBoundaryEnabled: false, sessionEndEnabled: true,
+      visemeEnabled: false, wordBoundaryEnabled: true,
+    }, outputFormat: "audio-24khz-96kbitrate-mono-mp3" }, language: { autoDetection: false } } }),
+  );
   const ssml =
-    "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
+    `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='${voice.split("-").slice(0, 2).join("-")}'>` +
     `<voice name='${voice}'><prosody pitch='${pitch}' rate='${rate}' volume='+0%'>` +
     `${escapeXml(text)}</prosody></voice></speak>`;
   socket.send(
     `X-RequestId:${requestId}\r\n` +
       "Content-Type:application/ssml+xml\r\n" +
-      `X-Timestamp:${timestamp}Z\r\n` +
+      `X-Timestamp:${timestamp}${translator ? "" : "Z"}\r\n` +
       `Path:ssml\r\n\r\n${ssml}`,
   );
 
-  timeoutId = setTimeout(() => finish(new Error("Edge TTS timed out")), 30_000);
+  timeoutId = setTimeout(() => finish(new Error("Speech synthesis timed out")), 60_000);
 
   return new Response(stream, {
     headers: {
@@ -501,14 +526,10 @@ async function connectToEdge(unixSeconds = Math.floor(Date.now() / 1000)) {
   url.searchParams.set("Sec-MS-GEC-Version", SEC_MS_GEC_VERSION);
 
   return fetch(url, {
+    redirect: "manual",
     headers: {
       Upgrade: "websocket",
       Origin: EDGE_EXTENSION_ORIGIN,
-      Pragma: "no-cache",
-      "Cache-Control": "no-cache",
-      "Accept-Encoding": "gzip, deflate, br, zstd",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Sec-WebSocket-Version": "13",
       "User-Agent":
         `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
         `(KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 ` +
@@ -633,11 +654,12 @@ body{max-width:720px;margin:48px auto;padding:0 20px;font:16px/1.7 system-ui,san
 a.button{display:inline-block;padding:10px 16px;border-radius:10px;background:#1769e0;color:#fff;text-decoration:none}
 code{background:#eef1f5;padding:2px 5px;border-radius:4px} .warn{padding:12px 15px;background:#fff5cf;border-radius:10px}
 </style></head><body><h1>Edge 点读</h1>
-<p>在 Linux 的 Chrome、Edge 或 Firefox 中，用 Microsoft Edge 在线语音朗读网页句子。</p>
+<p>在 Linux 的 Chrome、Edge 或 Firefox 中，用 Microsoft Translator 或 Edge 在线语音朗读网页句子。</p>
 <p>Worker 已运行。请单独安装 <code>read-clipboard-edge-tts.user.js</code>，并在油猴菜单中设置此 Worker 的 <code>/tts</code> 地址。</p>
+<p>用户脚本默认使用 Microsoft Translator 的 <code>ja-JP-MayuNeural</code>。可在菜单中切换服务和音色。更新后请同时部署 Worker 并安装新版用户脚本。</p>
 <p>选中文字后会出现可拖动的“朗”浮标；点击即可朗读，也可按 <code>Alt+R</code>。朗读时会逐词高亮，点击选区内的词可从该词继续。</p>
 <p class="warn">${tokenStatus}</p>
-<p>隐私提示：朗读文字会发往此 Worker 和 Microsoft 的在线语音服务；开启意义停顿时，还会发往 Worker 配置的 AI 服务。Edge TTS 是非公开接口，微软升级协议后可能需要同步更新脚本。</p>
+<p>隐私提示：朗读文字会发往此 Worker 和 Microsoft 的在线语音服务；开启意义停顿时，还会发往 Worker 配置的 AI 服务。Translator 和 Edge 使用非公开客户端接口，微软升级协议后可能需要更新脚本。</p>
 </body></html>`;
   return new Response(html, {
     headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      1.9.1
-// @description  Stream Edge neural speech with word tracking for selected text
+// @version      2.0.0
+// @description  Read selected text with Microsoft Translator or Edge, with word tracking
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-idle
@@ -27,6 +27,7 @@
   // Optional defaults; userscript menu settings override these values.
   const SEMANTIC_API_URL = ""; // Full HTTPS /chat/completions or /responses URL.
   const SEMANTIC_MODEL = "";
+  const DEFAULT_PROVIDER = "microsoft-translator";
   const NON_SPEECH_SELECTOR = "rt,rp,script,style,noscript,[aria-hidden=true]";
   const TIMED_STREAM_TYPE = "application/vnd.edge-point-reader.timed-stream";
   const FRAME_AUDIO = 1;
@@ -199,9 +200,37 @@
   registerMenu("Set API_TOKEN", "token", "", true);
   registerMenu("Set semantic API URL", "semanticApiUrl", SEMANTIC_API_URL);
   registerMenu("Set semantic model", "semanticModel", SEMANTIC_MODEL);
-  registerMenu("Set voice", "voice", "ja-JP-NanamiNeural");
+  if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("Set speech provider (microsoft-translator / edge)", () => {
+      const value = prompt("朗读服务：microsoft-translator 或 edge", speechSettings().provider);
+      if (value === null) return;
+      const provider = value.trim();
+      if (provider !== "microsoft-translator" && provider !== "edge") {
+        alert("请输入 microsoft-translator 或 edge");
+        return;
+      }
+      setValue("provider", provider);
+    });
+    GM_registerMenuCommand("Use Mayu (Microsoft Translator)", () => {
+      setValue("provider", "microsoft-translator");
+      setValue("translatorVoice", "ja-JP-MayuNeural");
+      alert("已选择 Microsoft Translator 的 Mayu 音色，下次朗读生效");
+    });
+    GM_registerMenuCommand("Set voice", () => {
+      const settings = speechSettings();
+      const hint = settings.provider === "microsoft-translator"
+        ? "例如 ja-JP-MayuNeural、ja-JP-AoiNeural、ja-JP-ShioriNeural" : "例如 ja-JP-NanamiNeural、ja-JP-KeitaNeural";
+      const value = prompt(`${settings.provider} 音色\n${hint}`, settings.voice);
+      if (value !== null && value.trim()) setValue(settings.provider === "edge" ? "voice" : "translatorVoice", value.trim());
+    });
+    GM_registerMenuCommand("Set pitch (Translator: st / Edge: Hz)", () => {
+      const settings = speechSettings();
+      const hint = settings.provider === "edge" ? "-50Hz 至 +50Hz" : "-12st 至 +7st";
+      const value = prompt(`${settings.provider} 音高：${hint}`, settings.pitch);
+      if (value !== null && value.trim()) setValue(settings.provider === "edge" ? "pitch" : "translatorPitch", value.trim());
+    });
+  }
   registerMenu("Set rate (for example -7%)", "rate", "-7%");
-  registerMenu("Set pitch (for example -4Hz)", "pitch", "-4Hz");
   registerMenu("Set rate variation (0-3 percentage points)", "rateJitter", "0");
   if (typeof GM_registerMenuCommand === "function") {
     GM_registerMenuCommand("切换日语自然分句标点（下次朗读生效）", () => {
@@ -424,9 +453,8 @@
       serial,
       endpoint,
       token: getValue("token", ""),
-      voice: getValue("voice", "ja-JP-NanamiNeural"),
+      ...speechSettings(),
       rate: getValue("rate", "-7%"),
-      pitch: getValue("pitch", "-4Hz"),
       rateJitter: Number(getValue("rateJitter", "0")),
       humanizeJa: getValue("humanizeJa", true),
       semantic: getValue("semantic", true),
@@ -478,6 +506,7 @@
     refreshSemanticPreview();
     const payload = JSON.stringify({
       text: chunk.text,
+      provider: session.provider,
       voice: session.voice,
       rate: session.rate,
       pitch: session.pitch,
@@ -556,7 +585,7 @@
         semanticPreviewRecords.push(preview);
         refreshSemanticPreview();
         const result = await requestSegmentResource(session, {
-          text: chunk.text, voice: session.voice, rate: session.rate,
+          text: chunk.text, provider: session.provider, voice: session.voice, rate: session.rate,
           pitch: session.pitch, rateJitter: session.rateJitter, humanizeJa: session.humanizeJa,
           semantic: true, segmentOnly: true,
           semanticApiUrl: session.semanticApiUrl, semanticModel: session.semanticModel,
@@ -603,7 +632,7 @@
 
   function segmentPayload(session, part) {
     return {
-      text: part.text, voice: session.voice, rate: session.rate, pitch: session.pitch,
+      text: part.text, provider: session.provider, voice: session.voice, rate: session.rate, pitch: session.pitch,
       rateJitter: session.rateJitter, humanizeJa: session.humanizeJa, semantic: false,
     };
   }
@@ -675,7 +704,7 @@
       try {
         handle = GM_xmlhttpRequest({
           method: "POST", url: session.endpoint, headers,
-          data: JSON.stringify(payload), responseType: "arraybuffer", timeout: 65000,
+          data: JSON.stringify(payload), responseType: "arraybuffer", timeout: 120000,
           onload(response) {
             if (speechSession !== session || serial !== requestSerial) {
               done(reject, new DOMException("已停止", "AbortError"));
@@ -683,7 +712,8 @@
             }
             try {
               if (response.status < 200 || response.status >= 300) {
-                throw new Error(`TTS 请求失败：HTTP ${response.status}`);
+                const detail = decoder.decode(new Uint8Array(response.response || new ArrayBuffer(0)));
+                throw new Error(detail ? `TTS ${response.status}: ${detail}` : `TTS 请求失败：HTTP ${response.status}`);
               }
               const contentType = response.responseHeaders?.match(/^Content-Type:\s*([^\r\n]+)/im)?.[1] || "";
               if (planOnly) {
@@ -1326,7 +1356,7 @@
         headers,
         data: payload,
         responseType: "arraybuffer",
-        timeout: 65000,
+        timeout: 120000,
         onload(response) {
           if (serial !== requestSerial) {
             reject(new DOMException("已停止", "AbortError"));
@@ -1575,6 +1605,13 @@
     selectionButton.setAttribute("aria-label", "朗读选中文字");
     selectionButton.style.background = "#1769e0";
     selectionButton.classList.remove("edge-point-reader-error");
+  }
+
+  function speechSettings() {
+    const provider = getValue("provider", DEFAULT_PROVIDER) === "edge" ? "edge" : "microsoft-translator";
+    return provider === "edge"
+      ? { provider, voice: getValue("voice", "ja-JP-NanamiNeural"), pitch: getValue("pitch", "-4Hz") }
+      : { provider, voice: getValue("translatorVoice", "ja-JP-MayuNeural"), pitch: getValue("translatorPitch", "+0st") };
   }
 
   function getValue(key, fallback) {

@@ -2,9 +2,10 @@
 
 Edge Point Reader adds Edge-style selection-to-read speech to normal web pages
 on Linux. A userscript shows a small read badge beside selected text, while a
-Cloudflare Worker streams Microsoft Edge neural TTS audio back to the browser.
+Cloudflare Worker streams Microsoft Translator or Edge neural speech to the browser.
 
-The default voice is `ja-JP-NanamiNeural` at `-7%` rate and `-4Hz` pitch.
+The userscript defaults to Microsoft Translator's `ja-JP-MayuNeural` at `-7%`
+rate and `+0st` pitch. Edge remains available from the provider menu.
 Long Japanese clauses can receive a small punctuation pause; random rate
 variation is off by default.
 
@@ -25,14 +26,15 @@ variation is off by default.
   `MediaSource` for faster startup.
 - Fall back to buffered playback of the same framed stream when MP3
   `MediaSource` is unavailable.
-- Configure the Worker endpoint, API token, voice, rate, pitch, and optional
+- Configure the Worker endpoint, API token, speech provider, voice, rate, pitch, and optional
   rate variation from the userscript
   menu.
 - Stop the request and playback immediately with `Esc` or the userscript menu.
 
 ## Files
 
-- `read-clipboard-edge-tts.js`: Cloudflare Module Worker and Edge TTS proxy.
+- `read-clipboard-edge-tts.js`: Cloudflare Module Worker and speech proxy.
+- `microsoft-translator.js`: temporary Translator authorization and Speech WebSocket connection.
 - `edge-tts-gec.js`: v2 authentication token implementation for the Worker.
 - `read-clipboard-edge-tts.user.js`: standalone Tampermonkey/Violentmonkey
   userscript.
@@ -122,7 +124,7 @@ credentials stay in the Worker and are never sent to the userscript. When enable
 the selected text is also sent to your configured AI provider. The AI may only
 insert `｜` and `‖`; any other change, including whitespace changes, rejects the
 result. Missing configuration, API errors, or a 25-second timeout leave the
-original Edge speech playing without extra pauses. There is no punctuation
+original speech playing without extra pauses. There is no punctuation
 fallback. **查看本次切分** reports the failure reason instead. A single enclosing
 Markdown code fence is accepted if the enclosed text passes the same exact check.
 
@@ -151,6 +153,19 @@ by default; the menu toggle applies to the next reading session.
 
 No deployment hostname is embedded in the userscript. On first use, it asks for
 the endpoint if none has been saved.
+
+For version 2.0.0, deploy the Worker and update the userscript together. The new
+userscript selects Translator and Mayu automatically. **Use Mayu (Microsoft
+Translator)** restores that choice. **Set speech provider** selects Translator
+or Edge. Translator does not require an Azure subscription key. The Worker
+obtains a temporary token and keeps it in memory. It never sends this token to
+the browser. Word timing, semantic segments, prefetch, and click navigation use
+the same stream format with either service.
+
+Existing Worker addresses, API tokens, and AI settings remain in use. The old
+`voice` and `pitch` settings remain available when you select Edge. Translator
+stores its voice and pitch separately. Older userscripts that omit `provider`
+continue to use Edge.
 
 The metadata contains `@connect *` because the Worker hostname is configured at
 runtime. To use a narrower permission, replace it after deployment with the
@@ -201,9 +216,11 @@ The userscript menu provides:
 - **Set API_TOKEN**
 - **Set semantic API URL**
 - **Set semantic model**
+- **Set speech provider (microsoft-translator / edge)**
+- **Use Mayu (Microsoft Translator)**
 - **Set voice**
 - **Set rate (for example -7%)**
-- **Set pitch (for example -4Hz)**
+- **Set pitch (Translator: st / Edge: Hz)**
 - **Set rate variation (0-3 percentage points)**: defaults to `0` (off).
 - **切换日语自然分句标点（下次朗读生效）**: toggle conservative pause
   punctuation, enabled by default for Japanese voices.
@@ -214,6 +231,9 @@ The userscript menu provides:
 Voice names use Microsoft short-name format, for example:
 
 ```text
+ja-JP-MayuNeural
+ja-JP-AoiNeural
+ja-JP-ShioriNeural
 ja-JP-NanamiNeural
 ja-JP-KeitaNeural
 zh-CN-XiaoxiaoNeural
@@ -221,7 +241,9 @@ en-US-EmmaMultilingualNeural
 ```
 
 Rates must include a sign and percent suffix, such as `-7%`, `+0%`, or `+25%`.
-Pitch uses signed hertz, such as `-4Hz` or `+0Hz`. If a rate was previously
+Translator pitch uses semitones from `-12st` to `+7st`, with a default of `+0st`.
+Edge pitch uses hertz, such as `-4Hz` or `+0Hz`. Each service has its own setting.
+If a rate was previously
 saved in the userscript menu, that saved value still takes priority; set it to
 `-7%` to use the new baseline.
 
@@ -232,14 +254,14 @@ boundaries. Very short words and example sentences usually stay unchanged.
 
 With semantic mode enabled, the Worker first returns an AI segmentation plan for
 one source chunk (up to 4,000 UTF-8 bytes). The userscript requests each meaning
-chunk as an independent Edge utterance with `semantic: false`, so the AI runs
+chunk as an independent utterance with `semantic: false`, so the AI runs
 only once per source chunk. The first clip can stream through MediaSource; the
 next clip is prefetched and buffered while the current clip plays. At most one
 future clip is kept in memory.
 
 The current clip plays to its `ended` event, then the userscript waits 200 ms at a
 small boundary or 380 ms at a large boundary before starting the next clip.
-These waits add to Edge's own leading/trailing silence. Slow prefetches and
+These waits add to the service's leading/trailing silence. Slow prefetches and
 background-tab timer throttling can make the interval longer. Independent clips
 can have different intonation from a whole-sentence synthesis.
 
@@ -284,9 +306,10 @@ curl https://YOUR_WORKER_HOST/tts \
   -H 'Authorization: Bearer YOUR_API_TOKEN' \
   --data '{
     "text": "こんにちは。",
-    "voice": "ja-JP-NanamiNeural",
+    "provider": "microsoft-translator",
+    "voice": "ja-JP-MayuNeural",
     "rate": "-7%",
-    "pitch": "-4Hz",
+    "pitch": "+0st",
     "rateJitter": 0,
     "humanizeJa": true,
     "semantic": true,
@@ -300,8 +323,10 @@ The optional JSON body fields are:
 
 | Field | Default | Effect |
 | --- | --- | --- |
-| `rate` | `"-7%"` | Edge prosody rate; an explicit older value still works. |
-| `pitch` | `"-4Hz"` | Edge prosody pitch. |
+| `provider` | `"edge"` for older clients | `"microsoft-translator"` selects Translator. The new userscript sends this explicitly. |
+| `voice` | `"ja-JP-MayuNeural"` for Translator, `"ja-JP-NanamiNeural"` for Edge | Microsoft voice short name. |
+| `rate` | `"-7%"` | Speech prosody rate. |
+| `pitch` | `"+0st"` for Translator, `"-4Hz"` for Edge | Pitch in the selected service's units. |
 | `rateJitter` | `0` | Integer `0` to `3`; adds a random ± number of percentage points to the rate for each synthesis request. `0` is deterministic. |
 | `humanizeJa` | `true` for `ja-JP-` voices | Insert conservative `、` pauses in longer Japanese clauses before synthesis. Set `false` for exact text. |
 
@@ -315,6 +340,8 @@ For an existing Yomitan adapter that already calls `/tts`, pass `pitch`,
 `rate`. The adapter must continue decoding the existing timed stream. For
 example, `{"text":"彼はそう言ったが私は信じなかった。","voice":"ja-JP-NanamiNeural","rate":"-7%","pitch":"-4Hz","rateJitter":0,"humanizeJa":true}`.
 No change to Yomitan's own audio-source configuration is required.
+To select Mayu in an adapter, also send `"provider":"microsoft-translator"`,
+`"voice":"ja-JP-MayuNeural"`, and a pitch such as `"+0st"`.
 
 The response is a streamed
 `application/vnd.edge-point-reader.timed-stream` body unless `segmentOnly` is
@@ -342,7 +369,7 @@ Legacy timed-stream clients can use these headers for the preview. Provider
 response bodies and tokens are not included in diagnostics.
 
 For segmented playback, send the same request with `semantic: true` and
-`segmentOnly: true`. This returns JSON without opening an Edge TTS connection:
+`segmentOnly: true`. This returns JSON without opening a speech connection:
 
 ```json
 {
@@ -368,10 +395,24 @@ Limits and validation:
   splits longer selections into consecutive requests.
 - Voice names may contain letters, digits, and hyphens.
 - Rate must be between `-100%` and `+100%`.
-- Pitch must be between `-50Hz` and `+50Hz`.
+- Edge pitch must be between `-50Hz` and `+50Hz`.
+- Translator pitch must be between `-12st` and `+7st`.
 - `rateJitter` must be an integer from `0` to `3`; `humanizeJa` must be boolean.
 
 ## Troubleshooting
+
+### Mayu fails or is unavailable
+
+Deploy the Worker with `microsoft-translator.js` and install userscript 2.0.0.
+Select **Use Mayu (Microsoft Translator)**. The request must include
+`"provider":"microsoft-translator"`. Edge does not provide this voice through
+the existing connection. Translator authorization refreshes automatically and
+retries one rejected handshake. Other failures stop playback and show an error.
+The Worker does not switch services automatically.
+
+Translator uses Hoshi's client authorization. Its Speech WebSocket enables word
+metadata through `synthesis.context`, following Microsoft's
+[Speech SDK protocol](https://github.com/microsoft/cognitive-services-speech-sdk-js/blob/master/src/common.speech/SynthesisContext.ts).
 
 ### The badge asks for a Worker address
 
@@ -387,14 +428,24 @@ not match. Set it again from the userscript menu.
 Microsoft's Edge speech endpoint can reject or temporarily throttle connections.
 If the response says `WebSocket handshake returned HTTP 403`, update the Worker
 and deploy it again. Microsoft changed the `Sec-MS-GEC` authentication to v2 in
-October 2026. This Worker uses the algorithm from
-[`edge-tts 7.3.0`](https://github.com/rany2/edge-tts/releases/tag/7.3.0).
+October 2026. This Worker uses the same protocol steps as Hoshi Reader Android
+and the `edge-tts 7.3.1` reference vectors.
 Changing only the Chromium version does not fix an old token algorithm.
 The Worker retries a 403 once with the time from Microsoft's `Date` header.
 
-`edge-tts-gec.js` contains the v2 token implementation. Deploy it together with
-`read-clipboard-edge-tts.js` through Wrangler. The port uses the upstream LGPLv3
-license. See `LICENSES/edge-tts.txt`.
+`edge-tts-gec.js` contains the v2 token implementation. It hashes the Microsoft
+prefix, exact Windows ticks, and client token with Web Crypto SHA-256. It then
+calculates CS64 with 32-bit arithmetic. The token uses five-minute time windows.
+The handshake uses Hoshi's client version, browser identity, extension origin,
+and random `muid` cookie. It does not follow redirects.
+
+Deploy this file together with `read-clipboard-edge-tts.js` through Wrangler.
+The port uses the upstream LGPLv3 license. See `LICENSES/edge-tts.txt`.
+
+The Worker keeps word timing enabled for highlighting. SSML uses the selected
+voice's language. Each synthesis request has a 60-second timeout and a 16 MiB
+audio limit. A connection that closes before `turn.end` produces a stream error,
+even if it already sent some audio.
 
 ### Playback starts slowly
 
@@ -443,14 +494,20 @@ Run the tests without external services or provider credentials:
 ```bash
 node --test tests/*.test.mjs
 node --check edge-tts-gec.js
+node --check microsoft-translator.js
 node --check read-clipboard-edge-tts.js
 node --check read-clipboard-edge-tts.user.js
 ```
 
-The tests compare v2 tokens with reference outputs from `edge-tts 7.3.0`.
-They mock the Edge WebSocket to check authentication, clock correction, default
-prosody, audio frames, and word frames. They also check playback error handling
-after a word click. Use a deployed Worker and a browser to check actual speech.
+The tests compare v2 tokens with Hoshi's browser and upstream reference vectors,
+including five-minute boundaries and times after 2038. They mock the Edge
+WebSocket to check authentication, clock correction, default prosody, audio
+frames, word timing, cancellation, and incomplete or oversized audio. Use a
+deployed Worker and a browser to check actual speech.
+
+Translator tests cover authorization signatures, token caching and refresh,
+request validation, Mayu synthesis frames, and word metadata. The new Worker
+also passed a live Translator test with Mayu audio and word boundaries.
 
 ## Related projects
 
@@ -475,7 +532,7 @@ after a word click. Use a deployed Worker and a browser to check actual speech.
 - The userscript stores its endpoint, token, voice, and rate in userscript
   manager storage.
 - Do not commit a real API token into either JavaScript file.
-- Edge TTS is an unofficial interface and can change without notice.
+- Translator client authorization and Edge TTS use unofficial interfaces that can change.
 - This implementation is intended for personal use. Review Microsoft's and
   Cloudflare's applicable terms and limits before broader deployment.
 
