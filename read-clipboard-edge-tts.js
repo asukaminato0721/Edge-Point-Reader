@@ -345,6 +345,12 @@ function semanticBoundary(offset, large) {
 
 async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
   const translator = provider === "microsoft-translator";
+  // Translator miscomputes word-boundary text after a fullwidth middle dot
+  // between words (e.g. 「注・二輪車」): every later Text is shifted or empty.
+  // The halfwidth dot has the same UTF-16 length and reads the same; map it
+  // back so boundary text still matches the caller's original text.
+  const swapMiddleDot = translator && text.includes("・") && !text.includes("･");
+  if (swapMiddleDot) text = text.replaceAll("・", "･");
   let handshake = await (translator ? connectToTranslator() : connectToEdge());
 
   // Clock skew can cause a 403. Retry once using Microsoft's Date.
@@ -438,7 +444,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
             else finish();
           }, finish);
         } else if (path === "audio.metadata") {
-          for (const boundary of wordBoundaries(event.data)) {
+          for (const boundary of wordBoundaries(event.data, swapMiddleDot)) {
             controller.enqueue(streamFrame(
               FRAME_WORD_BOUNDARY,
               new TextEncoder().encode(JSON.stringify(boundary)),
@@ -560,7 +566,7 @@ function protocolBody(message) {
   return separator >= 0 ? message.slice(separator + 4) : "";
 }
 
-function wordBoundaries(message) {
+function wordBoundaries(message, restoreMiddleDot = false) {
   const body = protocolBody(message);
   if (!body) return [];
   const metadata = JSON.parse(body);
@@ -576,7 +582,7 @@ function wordBoundaries(message) {
     boundaries.push({
       offset,
       duration,
-      text: unescapeXml(text),
+      text: restoreMiddleDot ? unescapeXml(text).replaceAll("･", "・") : unescapeXml(text),
     });
   }
   return boundaries;
