@@ -351,6 +351,9 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
   // back so boundary text still matches the caller's original text.
   const swapMiddleDot = translator && text.includes("・") && !text.includes("･");
   if (swapMiddleDot) text = text.replaceAll("・", "･");
+  // Both services read double-prime quotes 〝〟〞 aloud as separate words.
+  // Corner brackets are silent and keep the same UTF-16 length.
+  text = text.replace(/〝/g, "「").replace(/[〟〞]/g, "」");
   let handshake = await (translator ? connectToTranslator() : connectToEdge());
 
   // Clock skew can cause a 403. Retry once using Microsoft's Date.
