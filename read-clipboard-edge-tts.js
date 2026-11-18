@@ -343,16 +343,31 @@ function semanticBoundary(offset, large) {
   return { offset, pauseMs: large ? 380 : 200, level: large ? "large" : "small" };
 }
 
-async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
-  const translator = provider === "microsoft-translator";
+// [original, spoken, Translator only]
+const SPEECH_SUBSTITUTIONS = [
   // Translator miscomputes word-boundary text after a fullwidth middle dot
   // between words (e.g. 「注・二輪車」): every later Text is shifted or empty.
-  // The halfwidth dot has the same UTF-16 length and reads the same; map it
-  // back so boundary text still matches the caller's original text.
-  const swapMiddleDot = translator && text.includes("・") && !text.includes("･");
-  if (swapMiddleDot) text = text.replaceAll("・", "･");
+  ["・", "･", true],
+  // 2010 Jōyō glyph forms missing from both voices' dictionaries; they are
+  // skipped silently (「噓だ」) or misread (「𠮟られた」).
+  ["噓", "嘘", false],
+  ["𠮟", "叱", false],
+];
+
+async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
+  const translator = provider === "microsoft-translator";
+  // Rewrite characters the voices mishandle. Boundary text is mapped back so
+  // the userscript can still find each word in the original selection.
+  const restore = [];
+  for (const [from, to, translatorOnly] of SPEECH_SUBSTITUTIONS) {
+    if ((translatorOnly && !translator) || !text.includes(from)) continue;
+    // Skip when the replacement already occurs: it could not be mapped back.
+    if (text.includes(to)) continue;
+    text = text.replaceAll(from, to);
+    restore.push([to, from]);
+  }
   // Both services read double-prime quotes 〝〟〞 aloud as separate words.
-  // Corner brackets are silent and keep the same UTF-16 length.
+  // Corner brackets are silent and never appear in boundary text.
   text = text.replace(/〝/g, "「").replace(/[〟〞]/g, "」");
   let handshake = await (translator ? connectToTranslator() : connectToEdge());
 
@@ -447,7 +462,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
             else finish();
           }, finish);
         } else if (path === "audio.metadata") {
-          for (const boundary of wordBoundaries(event.data, swapMiddleDot)) {
+          for (const boundary of wordBoundaries(event.data, restore)) {
             controller.enqueue(streamFrame(
               FRAME_WORD_BOUNDARY,
               new TextEncoder().encode(JSON.stringify(boundary)),
@@ -569,7 +584,7 @@ function protocolBody(message) {
   return separator >= 0 ? message.slice(separator + 4) : "";
 }
 
-function wordBoundaries(message, restoreMiddleDot = false) {
+function wordBoundaries(message, restore = []) {
   const body = protocolBody(message);
   if (!body) return [];
   const metadata = JSON.parse(body);
@@ -585,7 +600,7 @@ function wordBoundaries(message, restoreMiddleDot = false) {
     boundaries.push({
       offset,
       duration,
-      text: restoreMiddleDot ? unescapeXml(text).replaceAll("･", "・") : unescapeXml(text),
+      text: restore.reduce((value, [to, from]) => value.replaceAll(to, from), unescapeXml(text)),
     });
   }
   return boundaries;
