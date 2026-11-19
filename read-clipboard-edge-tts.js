@@ -145,6 +145,10 @@ export default {
     if (typeof humanizeJa !== "boolean") {
       return json({ error: "humanizeJa must be true or false" }, 400);
     }
+    const readings = input?.readings ?? [];
+    if (!validReadings(readings, input.text)) {
+      return json({ error: "readings must be sorted, non-overlapping {start, end, reading} spans of text" }, 400);
+    }
     if (input?.segmentOnly === true && input?.semantic !== true) {
       return json({ error: "segmentOnly requires semantic: true" }, 400);
     }
@@ -176,9 +180,9 @@ export default {
       if (input?.segmentOnly === true) {
         return json({ mode: "segments", boundaries, source: semanticSource, error: semanticErrorCode });
       }
-      const spokenText = humanizeJa && voice.startsWith("ja-JP-")
-        ? humanizeJapanese(text) : text;
-      return await synthesize(spokenText, voice, variedRate(rate, rateJitter), pitch,
+      const speech = spokenText(input.text, readings, translator,
+        humanizeJa && voice.startsWith("ja-JP-"));
+      return await synthesize(speech, voice, variedRate(rate, rateJitter), pitch,
         boundaries, semanticSource, semanticErrorCode, rateJitter > 0, provider);
     } catch (error) {
       return json(
@@ -343,32 +347,182 @@ function semanticBoundary(offset, large) {
   return { offset, pauseMs: large ? 380 : 200, level: large ? "large" : "small" };
 }
 
-// [original, spoken, Translator only]
-const SPEECH_SUBSTITUTIONS = [
+const MAX_READINGS = 1000;
+const MAX_READING_LENGTH = 64;
+
+// Characters the voices mishandle, replaced in the spoken text only.
+const SPEECH_SUBSTITUTIONS = new Map([
   // Translator miscomputes word-boundary text after a fullwidth middle dot
   // between words (e.g. 「注・二輪車」): every later Text is shifted or empty.
-  ["・", "･", true],
+  ["・", { to: "･", translatorOnly: true }],
   // 2010 Jōyō glyph forms missing from both voices' dictionaries; they are
   // skipped silently (「噓だ」) or misread (「𠮟られた」).
-  ["噓", "嘘", false],
-  ["𠮟", "叱", false],
-];
+  ["噓", { to: "嘘" }],
+  ["𠮟", { to: "叱" }],
+  // Both services read double-prime quotes aloud; corner brackets are silent.
+  ["〝", { to: "「" }],
+  ["〟", { to: "」" }],
+  ["〞", { to: "」" }],
+  // Both services derive boundary Text from SSML offsets that ignore entity
+  // escaping, so &amp; and friends shift every later word. Fullwidth forms
+  // need no escaping and read the same.
+  ["&", { to: "＆" }],
+  ["<", { to: "＜" }],
+  [">", { to: "＞" }],
+  ['"', { to: "＂" }],
+  ["'", { to: "＇" }],
+]);
 
-async function synthesize(text, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
-  const translator = provider === "microsoft-translator";
-  // Rewrite characters the voices mishandle. Boundary text is mapped back so
-  // the userscript can still find each word in the original selection.
-  const restore = [];
-  for (const [from, to, translatorOnly] of SPEECH_SUBSTITUTIONS) {
-    if ((translatorOnly && !translator) || !text.includes(from)) continue;
-    // Skip when the replacement already occurs: it could not be mapped back.
-    if (text.includes(to)) continue;
-    text = text.replaceAll(from, to);
-    restore.push([to, from]);
+function speakable(ch, translator) {
+  const substitution = SPEECH_SUBSTITUTIONS.get(ch);
+  return substitution && (!substitution.translatorOnly || translator) ? substitution.to : ch;
+}
+
+function validReadings(readings, text) {
+  if (!Array.isArray(readings) || readings.length > MAX_READINGS || typeof text !== "string") return false;
+  let previousEnd = 0;
+  for (const item of readings) {
+    const { start, end, reading } = item ?? {};
+    if (!Number.isInteger(start) || !Number.isInteger(end) ||
+        start < previousEnd || end <= start || end > text.length ||
+        typeof reading !== "string" || !reading.trim() || reading.length > MAX_READING_LENGTH ||
+        /[\u0000-\u001f]/.test(reading) ||
+        splitsSurrogate(text, start) || splitsSurrogate(text, end)) return false;
+    previousEnd = end;
   }
-  // Both services read double-prime quotes 〝〟〞 aloud as separate words.
-  // Corner brackets are silent and never appear in boundary text.
-  text = text.replace(/〝/g, "「").replace(/[〟〞]/g, "」");
+  return true;
+}
+
+function splitsSurrogate(text, offset) {
+  return /[\uDC00-\uDFFF]/.test(text[offset] || "") && /[\uD800-\uDBFF]/.test(text[offset - 1] || "");
+}
+
+// Build the text sent to the voice and remember, for each spoken UTF-16 unit,
+// which span of the request text it came from. Word boundaries are then
+// reported as request-text offsets even after readings, substitutions,
+// whitespace cleanup and inserted pauses changed the spoken text.
+function spokenText(original, readings, translator, humanizeJa) {
+  let units = [];
+  let next = 0;
+  for (let i = 0; i < original.length;) {
+    const reading = readings[next];
+    if (reading?.start === i) {
+      for (const ch of reading.reading) {
+        units.push({ ch: speakable(ch, translator), start: reading.start, end: reading.end, reading: true });
+      }
+      i = reading.end;
+      next++;
+      continue;
+    }
+    const ch = String.fromCodePoint(original.codePointAt(i));
+    units.push({ ch: speakable(ch, translator), start: i, end: i + ch.length });
+    i += ch.length;
+  }
+
+  // Same rules as cleanText, applied unit by unit.
+  const cleaned = [];
+  for (const unit of units) {
+    const ch = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(unit.ch) ? " " : unit.ch;
+    const previous = cleaned.at(-1)?.ch;
+    if (/[\t \f\v]/.test(ch) && previous === " ") continue;
+    if (ch === "\n" && previous === "\n" && cleaned.at(-2)?.ch === "\n") continue;
+    cleaned.push({ ...unit, ch: /[\t \f\v]/.test(ch) ? " " : ch });
+  }
+  let first = 0;
+  let last = cleaned.length;
+  while (first < last && !cleaned[first].ch.trim()) first++;
+  while (last > first && !cleaned[last - 1].ch.trim()) last--;
+  units = cleaned.slice(first, last);
+
+  const plain = units.map((unit) => unit.ch).join("");
+  const starts = [];
+  const ends = [];
+  const fromReading = [];
+  for (const unit of units) {
+    for (let k = 0; k < unit.ch.length; k++) {
+      starts.push(unit.start);
+      ends.push(unit.end);
+      fromReading.push(Boolean(unit.reading));
+    }
+  }
+  let text = plain;
+  let mapStart = starts;
+  let mapEnd = ends;
+  let mapReading = fromReading;
+  if (humanizeJa) {
+    // humanizeJapanese only inserts pause commas; inserted units map nowhere.
+    text = humanizeJapanese(plain);
+    mapStart = [];
+    mapEnd = [];
+    mapReading = [];
+    let k = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === plain[k]) {
+        mapStart.push(starts[k]);
+        mapEnd.push(ends[k]);
+        mapReading.push(fromReading[k]);
+        k++;
+      } else {
+        mapStart.push(-1);
+        mapEnd.push(-1);
+        mapReading.push(false);
+      }
+    }
+  }
+
+  let cursor = 0;
+  let previousEnd = 0;
+  return {
+    text,
+    // Translator takes ruby readings as <sub alias>, so the voice sees the
+    // original kanji with the author's reading. Its word boundaries report the
+    // alias text, which is what `text` holds, so locate() works unchanged.
+    // Edge closes the connection on <sub>, so it speaks the plain reading.
+    ssml() {
+      if (!translator) return escapeXml(text);
+      let result = "";
+      for (let i = 0; i < text.length;) {
+        if (!mapReading[i]) {
+          let j = i;
+          while (j < text.length && !mapReading[j]) j++;
+          result += escapeXml(text.slice(i, j));
+          i = j;
+          continue;
+        }
+        let j = i;
+        while (j < text.length && mapReading[j] && mapStart[j] === mapStart[i]) j++;
+        result += `<sub alias="${escapeXml(text.slice(i, j))}">` +
+          `${escapeXml(Array.from(original.slice(mapStart[i], mapEnd[i]), (ch) => speakable(ch, true)).join(""))}</sub>`;
+        i = j;
+      }
+      return result;
+    },
+    // Find a boundary's text in the spoken text, in order, and return the
+    // matching request-text span. Unknown text keeps the old indexOf path.
+    locate(word) {
+      if (!word) return null;
+      const index = text.indexOf(word, cursor);
+      if (index < 0) return { text: word };
+      cursor = index + word.length;
+      let start = Infinity;
+      let end = -1;
+      for (let i = index; i < cursor; i++) {
+        if (mapStart[i] < 0) continue;
+        start = Math.min(start, mapStart[i]);
+        end = Math.max(end, mapEnd[i]);
+      }
+      if (end < 0) return null;
+      // A reading split across two words would repeat its kanji; give the
+      // second word only what follows the first.
+      if (start < previousEnd && end > previousEnd) start = previousEnd;
+      previousEnd = Math.max(previousEnd, end);
+      return { text: original.slice(start, end), textStart: start, textEnd: end };
+    },
+  };
+}
+
+async function synthesize(speech, voice, rate, pitch, semantic = [], semanticSource = "disabled", semanticErrorCode = "", noCache = false, provider = "edge") {
+  const translator = provider === "microsoft-translator";
   let handshake = await (translator ? connectToTranslator() : connectToEdge());
 
   // Clock skew can cause a 403. Retry once using Microsoft's Date.
@@ -462,7 +616,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
             else finish();
           }, finish);
         } else if (path === "audio.metadata") {
-          for (const boundary of wordBoundaries(event.data, restore)) {
+          for (const boundary of wordBoundaries(event.data, speech)) {
             controller.enqueue(streamFrame(
               FRAME_WORD_BOUNDARY,
               new TextEncoder().encode(JSON.stringify(boundary)),
@@ -518,7 +672,7 @@ async function synthesize(text, voice, rate, pitch, semantic = [], semanticSourc
   const ssml =
     `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='${voice.split("-").slice(0, 2).join("-")}'>` +
     `<voice name='${voice}'><prosody pitch='${pitch}' rate='${rate}' volume='+0%'>` +
-    `${escapeXml(text)}</prosody></voice></speak>`;
+    `${speech.ssml()}</prosody></voice></speak>`;
   socket.send(
     `X-RequestId:${requestId}\r\n` +
       "Content-Type:application/ssml+xml\r\n" +
@@ -584,7 +738,7 @@ function protocolBody(message) {
   return separator >= 0 ? message.slice(separator + 4) : "";
 }
 
-function wordBoundaries(message, restore = []) {
+function wordBoundaries(message, speech) {
   const body = protocolBody(message);
   if (!body) return [];
   const metadata = JSON.parse(body);
@@ -597,11 +751,9 @@ function wordBoundaries(message, restore = []) {
     if (!Number.isFinite(offset) || !Number.isFinite(duration) || typeof text !== "string") {
       continue;
     }
-    boundaries.push({
-      offset,
-      duration,
-      text: restore.reduce((value, [to, from]) => value.replaceAll(to, from), unescapeXml(text)),
-    });
+    const span = speech.locate(unescapeXml(text));
+    if (!span) continue;
+    boundaries.push({ offset, duration, ...span });
   }
   return boundaries;
 }

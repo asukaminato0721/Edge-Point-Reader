@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Edge Point Reader (Linux)
 // @namespace    edge-point-reader
-// @version      2.0.0
+// @version      2.1.0
 // @description  Read selected text with Microsoft Translator or Edge, with word tracking
 // @match        http://*/*
 // @match        https://*/*
@@ -429,10 +429,75 @@
           textEnd: end - leading,
         });
       }
-      return { text: text.slice(leading, contentEnd), segments: trimmedSegments };
+      return {
+        text: text.slice(leading, contentEnd),
+        segments: trimmedSegments,
+        readings: rubyReadings(trimmedSegments),
+      };
     } catch {
       return null;
     }
+  }
+
+  // Ruby annotations (<ruby>背負<rt>せお</rt></ruby>) give the author's reading.
+  // Only fully selected bases are used; the Worker speaks the reading instead.
+  function rubyReadings(segments) {
+    const groups = new Map();
+    for (const segment of segments) {
+      const ruby = segment.node.parentElement?.closest("ruby");
+      if (!ruby) continue;
+      const rt = rubyTextFor(segment.node, ruby);
+      if (!rt) continue;
+      const group = groups.get(rt);
+      if (group) {
+        group.end = segment.textEnd;
+        group.selected += segment.nodeEnd - segment.nodeStart;
+        group.total += segment.node.data.length;
+      } else {
+        groups.set(rt, {
+          rt,
+          start: segment.textStart,
+          end: segment.textEnd,
+          selected: segment.nodeEnd - segment.nodeStart,
+          total: segment.node.data.length,
+        });
+      }
+    }
+    const readings = [];
+    let previousEnd = 0;
+    for (const group of groups.values()) {
+      const reading = group.rt.textContent.replace(/\s+/g, "");
+      if (!reading || reading.length > 64 || group.selected !== group.total ||
+          group.start < previousEnd || group.end <= group.start) continue;
+      readings.push({ start: group.start, end: group.end, reading });
+      previousEnd = group.end;
+    }
+    return readings;
+  }
+
+  // The base text before an <rt> is read as that <rt>, as browsers lay it out.
+  function rubyTextFor(node, ruby) {
+    let item = node;
+    while (item.parentNode !== ruby) {
+      item = item.parentNode;
+      if (!item) return null;
+    }
+    for (let sibling = item.nextSibling; sibling; sibling = sibling.nextSibling) {
+      if (sibling.nodeName === "RT") return sibling;
+      if (sibling.nodeName === "RP") continue;
+      if (sibling.nodeType === Node.TEXT_NODE && !sibling.data.trim()) continue;
+      if (sibling.nodeName !== "RB" && sibling.nodeType !== Node.TEXT_NODE) return null;
+    }
+    return null;
+  }
+
+  // Readings that lie completely inside [start, end), relative to start.
+  function readingsFor(map, start, end) {
+    if (!map?.readings?.length) return undefined;
+    const readings = map.readings
+      .filter((item) => item.start >= start && item.end <= end)
+      .map((item) => ({ start: item.start - start, end: item.end - start, reading: item.reading }));
+    return readings.length ? readings : undefined;
   }
 
   async function speak(text, range, block, textMap) {
@@ -506,6 +571,8 @@
     refreshSemanticPreview();
     const payload = JSON.stringify({
       text: chunk.text,
+      readings: session.textMap?.text.slice(chunk.start, chunk.end) === chunk.text
+        ? readingsFor(session.textMap, chunk.start, chunk.end) : undefined,
       provider: session.provider,
       voice: session.voice,
       rate: session.rate,
@@ -632,7 +699,10 @@
 
   function segmentPayload(session, part) {
     return {
-      text: part.text, provider: session.provider, voice: session.voice, rate: session.rate, pitch: session.pitch,
+      text: part.text,
+      readings: session.textMap?.text.slice(part.start, part.start + part.text.length) === part.text
+        ? readingsFor(session.textMap, part.start, part.start + part.text.length) : undefined,
+      provider: session.provider, voice: session.voice, rate: session.rate, pitch: session.pitch,
       rateJitter: session.rateJitter, humanizeJa: session.humanizeJa, semantic: false,
     };
   }
@@ -976,7 +1046,16 @@
 
     let textStart = -1;
     let range = null;
-    if (speechMap) {
+    const serverStart = boundary?.textStart;
+    const serverEnd = boundary?.textEnd;
+    if (speechMap && Number.isInteger(serverStart) && Number.isInteger(serverEnd) &&
+        serverStart >= 0 && serverEnd > serverStart && serverEnd <= speechMap.text.length) {
+      // Newer Workers report where the word is in the request text, which
+      // also covers ruby readings and other text the voice did not see.
+      textStart = serverStart;
+      wordSearchOffset = Math.max(wordSearchOffset, serverEnd);
+      range = rangeForTextOffsets(serverStart, serverEnd);
+    } else if (speechMap) {
       let matchedText = text;
       textStart = speechMap.text.indexOf(matchedText, wordSearchOffset);
       // Edge can attach newly inserted pause punctuation to a word boundary.
